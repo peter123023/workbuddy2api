@@ -50,10 +50,9 @@ def get_device_token(force: bool = False) -> str | None:
         return None
 
     env = dict(os.environ)
-    # 允许通过环境变量覆盖 SDK 目录 / channelId，未设置则用 helper 内的默认值
-    if not env.get("WORKBUDDY_TURING_SDK_DIR"):
-        env.setdefault("WORKBUDDY_TURING_SDK_DIR",
-                       r"D:\workbuddy\resources\app.asar.unpacked\native\turing-sdk")
+    # 不写死 SDK 目录：若用户显式设置了 WORKBUDDY_TURING_SDK_DIR 则下发，
+    # 否则交给 turing_helper.js 按本机安装位置自动发现（不同用户安装目录不同）。
+    # 注意：不要在此处兜底写死某个绝对路径，否则会覆盖 helper 的自动发现逻辑。
 
     try:
         out = subprocess.run(

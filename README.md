@@ -42,7 +42,7 @@
 | 安装目录 | `D:\workbuddy`（Windows，Git Bash 风格） |
 | 主程序包 | `D:\workbuddy\resources\app.asar`（Electron 打包，约 287MB） |
 | 解包产物 | `D:\workbuddy\app_source`（cli / main / preload / renderer） |
-| 原生模块 | `D:\workbuddy\resources\app.asar.unpacked\native\turing-sdk`（设备风控 SDK） |
+| 原生模块 | 桌面端安装目录下的 `resources/app.asar.unpacked/native/turing-sdk`（运行时由 `turing_helper.js` 自动发现本机安装位置，可用 `WORKBUDDY_TURING_SDK_DIR` 覆盖） |
 
 解包不是为了修改桌面端，而是为了 **确认接口契约**：
 
@@ -151,7 +151,7 @@ converter.py  (FastAPI)
 可通过环境变量覆盖路径 / channelId：
 
 ```bash
-WORKBUDDY_TURING_SDK_DIR       # SDK 目录（默认 D:\workbuddy\resources\app.asar.unpacked\native\turing-sdk）
+WORKBUDDY_TURING_SDK_DIR       # SDK 目录（自动发现本机 WorkBuddy 安装位置；若安装目录特殊可显式指定以覆盖自动发现）
 WORKBUDDY_TURING_CHANNEL_ID    # 默认 109144
 WORKBUDDY_PRODUCT_NAME         # 默认 WorkBuddy
 WORKBUDDY_VERSION              # 默认 2.0.0
@@ -482,7 +482,7 @@ workbuddy2api/
 
 # 逆向产物（不在本仓库，存在于 D:\workbuddy）
 D:\workbuddy\app_source\      # cli / main / preload / renderer 解包源码
-D:\workbuddy\resources\app.asar.unpacked\native\turing-sdk\   # 设备风控原生模块
+D:\workbuddy\resources\app.asar.unpacked\native\turing-sdk\   # 设备风控原生模块（运行时不写死此路径，由 turing_helper.js 自动发现）
 ```
 
 ---
