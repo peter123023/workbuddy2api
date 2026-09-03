@@ -308,7 +308,7 @@
 
 <!-- 通用模态框 -->
 <div id="modal" class="fixed inset-0 modal-overlay hidden items-center justify-center z-50 p-3">
-  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-2xl p-6 fade-in max-h-[88vh] overflow-y-auto" id="modalBox"></div>
+  <div class="bg-white rounded-2xl shadow-2xl w-full max-w-6xl p-6 fade-in max-h-[88vh] overflow-y-auto" id="modalBox"></div>
 </div>
 
 <div id="toasts" class="toast flex flex-col gap-2"></div>
@@ -474,18 +474,19 @@ async function viewCreditDetails(id, name){
     const { ok, data:d } = await safeJson(r);
     if(!r.ok){ $("#creditDetailBody").innerHTML = `<p class="text-red-500 text-sm">获取失败: ${esc(d.detail||"未知错误")}</p>`; return; }
     const pkgs = d.packages || [];
-    let totalRemain = 0, totalSize = 0, totalUsed = 0;
-    for(const p of pkgs){ totalRemain += p.remain||0; totalSize += p.total||0; totalUsed += p.used||0; }
+    let totalRemain = 0, totalSize = 0, totalUsed = 0, totalAccountRemain = 0;
+    for(const p of pkgs){ totalRemain += p.remain||0; totalSize += p.total||0; totalUsed += p.used||0; totalAccountRemain += p.account_remain||0; }
     $("#creditDetailBody").innerHTML = `
       <div class="mb-3 p-3 bg-slate-50 rounded-lg flex flex-wrap gap-6 text-sm">
         <div><span class="text-slate-400">合计总量:</span> <strong>${totalSize}</strong></div>
-        <div><span class="text-slate-400">合计剩余:</span> <strong class="${totalRemain>0?'text-emerald-600':'text-red-500'}">${totalRemain}</strong></div>
+        <div><span class="text-slate-400">合计剩余(周期):</span> <strong class="${totalRemain>0?'text-emerald-600':'text-red-500'}">${totalRemain}</strong></div>
+        <div><span class="text-slate-400">账号层级剩余:</span> <strong class="text-slate-600">${totalAccountRemain}</strong></div>
         <div><span class="text-slate-400">已用:</span> <strong class="text-slate-600">${totalUsed}</strong></div>
         <div><span class="text-slate-400">包数:</span> <strong>${pkgs.length}</strong></div>
       </div>
       <div class="rounded-lg border overflow-x-auto">
         <table class="w-full text-sm min-w"><thead class="bg-slate-50 text-slate-500 text-left sticky top-0"><tr>
-          <th class="px-3 py-2">包名称</th><th class="px-3 py-2">总量</th><th class="px-3 py-2">剩余</th><th class="px-3 py-2">已用</th>
+          <th class="px-3 py-2">包名称</th><th class="px-3 py-2">总量</th><th class="px-3 py-2">周期剩余</th><th class="px-3 py-2">账号剩余</th><th class="px-3 py-2">已用</th>
           <th class="px-3 py-2">周期开始</th><th class="px-3 py-2">周期结束(到期)</th><th class="px-3 py-2">绝对到期</th><th class="px-3 py-2">进度</th>
         </tr></thead><tbody>${
           pkgs.length ? pkgs.map(p => {
@@ -495,12 +496,13 @@ async function viewCreditDetails(id, name){
             return `<tr class="border-t"><td class="px-3 py-2 max-w-[220px] truncate" title="${esc(p.name)}">${esc(p.name)}</td>
               <td class="px-3 py-2">${p.total}</td>
               <td class="px-3 py-2 ${p.remain>0?'text-emerald-600':'text-slate-400'}">${p.remain}${isExpired?' <span class="text-[10px] text-red-500 font-bold">已过期</span>':''}</td>
+              <td class="px-3 py-2 text-slate-500">${p.account_remain||0}</td>
               <td class="px-3 py-2 text-slate-500">${p.used||0}</td>
               <td class="px-3 py-2 text-xs text-slate-400 whitespace-nowrap">${p.cycle_start || '-'}</td>
               <td class="px-3 py-2 text-xs whitespace-nowrap ${isExpired&&!p.deduction_end?'text-red-500':''}">${p.cycle_end || '-'}</td>
               <td class="px-3 py-2 text-xs whitespace-nowrap ${isExpired&&p.deduction_end?'text-red-500':''}">${p.deduction_end || (p.deduction_end_ts?'永不过期':'-')}</td>
               <td class="px-3 py-2"><div class="w-24 h-2 bg-slate-200 rounded-full overflow-hidden"><div class="h-full ${p.remain>0?(isExpired?'bg-amber-500':'bg-emerald-500'):'bg-red-400'}" style="width:${pct}%"></div></div> <span class="text-[10px] text-slate-400">${pct}%</span></td></tr>`;
-          }).join('') : '<tr><td colspan="8" class="px-3 py-6 text-center text-slate-400">无积分包数据</td></tr>'
+          }).join('') : '<tr><td colspan="9" class="px-3 py-6 text-center text-slate-400">无积分包数据</td></tr>'
         }</tbody></table>
       </div>`;
   } catch(e) { $("#creditDetailBody").innerHTML = `<p class="text-red-500 text-sm">请求异常: ${esc(e.message)}</p>`; }
@@ -715,17 +717,54 @@ function openUpload(){
     </div>`);
 }
 async function submitUpload(){
-  let text = $("#upText").value.trim();
-  const file = $("#upFile").files;
-  if(file.length){ for(const f of file){ text += "\n" + await f.text(); } }
-  if(!text){ toast("内容为空","err"); return; }
-  let items = [];
-  try { const j = JSON.parse(text); items = Array.isArray(j)?j:[j]; }
-  catch { for(const line of text.split("\n")){ const t=line.trim(); if(!t) continue; try{ items.push(JSON.parse(t)); }catch(e){} } }
-  const body = { items: items.map(x => ({ name: x.account?.nickname || x.name || "", auth_json: JSON.stringify(x) })) };
+  const text = $("#upText").value.trim();
+  const files = $("#upFile").files;
+  if(!text && !files.length){ toast("内容为空","err"); return; }
+
+  // 去掉 BOM，避免 Windows 生成的 .info 文件解析失败
+  function stripBOM(s){ return s.replace(/^\uFEFF/, ''); }
+  function tryParse(s){
+    s = stripBOM(s).trim();
+    if(!s) return null;
+    try { return JSON.parse(s); } catch { return null; }
+  }
+
+  let allItems = [];
+
+  // 1) 解析文本域：支持 JSON 数组 / 单个 JSON 对象 / JSONL 每行一个对象
+  if(text){
+    const j = tryParse(text);
+    if(j){ allItems = Array.isArray(j) ? j : [j]; }
+    else {
+      for(const line of text.split("\n")){
+        const t = line.trim(); if(!t) continue;
+        const o = tryParse(t); if(o) allItems.push(o);
+      }
+    }
+  }
+
+  // 2) 逐个解析文件，避免多文件拼接后格式混乱
+  for(const f of files){
+    try {
+      const s = await f.text();
+      const j = tryParse(s);
+      if(j){ allItems = allItems.concat(Array.isArray(j) ? j : [j]); }
+      else {
+        for(const line of s.split("\n")){
+          const t = line.trim(); if(!t) continue;
+          const o = tryParse(t); if(o) allItems.push(o);
+        }
+      }
+    } catch(e) {
+      console.warn("文件读取失败:", f.name, e);
+    }
+  }
+
+  if(!allItems.length){ toast("未解析出任何账号凭证","err"); return; }
+  const body = { items: allItems.map(x => ({ name: x.account?.nickname || x.name || "", auth_json: JSON.stringify(x) })) };
   const r = await api("/api/accounts/batch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   const d = await r.json().catch(()=>({}));
-  closeModal(); toast(r.ok?`已添加 ${d.added||0} 个账号`:"上传失败", r.ok?"ok":"err");
+  closeModal(); toast(r.ok?`已添加 ${d.added||0} 个账号${d.errors&&d.errors.length?`（${d.errors.length} 个失败）`:''}`:"上传失败", r.ok?"ok":"err");
   if(d.errors && d.errors.length) console.warn(d.errors);
   loadAccounts();
 }

@@ -361,7 +361,12 @@ class CredentialManager:
         return result
 
     def fetch_balance(self) -> dict:
-        """获取当前账号积分汇总，仅返回总量与剩余（可用积分）。"""
+        """获取当前账号积分汇总，仅返回总量与剩余（可用积分）。
+
+        注意：必须使用 CycleCapacityRemain（当前周期剩余），而不是 CapacityRemain。
+        CodeBuddy 个人体验版等一次性资源在账号层级 CapacityRemain 仍显示原始额度，
+        但当期已用完后 CycleCapacityRemain 为 0；界面上的「累积剩余」也以周期剩余为准。
+        """
         data = self._request_backend("POST", "/v2/billing/meter/get-user-resource", {})
         resp = data.get("data", {}).get("Response", {}).get("Data", {}) or {}
         total = 0
@@ -369,11 +374,12 @@ class CredentialManager:
         for a in resp.get("Accounts") or []:
             if a.get("CapacityUnit") != "credits":
                 continue
-            total += a.get("CapacityRemain") or 0
+            # 当前周期剩余才是真实可用额度
+            total += a.get("CycleCapacityRemain") or 0
             total_size += a.get("CapacitySize") or 0
         return {
             "total": total_size,    # 总积分
-            "remain": total,        # 可用积分（剩余额度）
+            "remain": total,        # 可用积分（当前周期剩余额度）
         }
 
 

@@ -55,6 +55,8 @@ class AccountSession:
         """获取积分明细（每个积分包的总量/剩余/到期时间）。
 
         对应截图中的「版本基础用量」「权益赠送包」等条目。
+        剩余额度使用 CycleCapacityRemain（当前周期剩余），与官方界面「累积剩余」对齐；
+        CapacityRemain 仅作为账号层级总剩余保留在字段 account_remain 中供参考。
         """
         data = self.cm._request_backend("POST", "/v2/billing/meter/get-user-resource", {})
         resp = data.get("data", {}).get("Response", {}).get("Data", {}) or {}
@@ -70,8 +72,11 @@ class AccountSession:
             packages.append({
                 "name": a.get("PackageName") or a.get("Name") or "未命名",
                 "total": a.get("CapacitySize") or 0,
-                "remain": a.get("CapacityRemain") or 0,
-                "used": a.get("CapacityUsed") or 0,
+                # 真实可用额度以当前周期剩余为准（体验版用完时 CapacityRemain 仍可能为 500）
+                "remain": a.get("CycleCapacityRemain") or 0,
+                "used": a.get("CycleCapacityUsed") or 0,
+                "account_remain": a.get("CapacityRemain") or 0,
+                "account_used": a.get("CapacityUsed") or 0,
                 "cycle_start": a.get("CycleStartTime") or "",
                 "cycle_end": cycle_end,
                 "deduction_end_ts": deduction_end_ts,
