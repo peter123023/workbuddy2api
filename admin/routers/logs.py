@@ -1,6 +1,7 @@
 """用量日志管理：服务端分页 + 过滤（基于 usage_logs 表，由代理网关写入）。"""
 import csv
 import io
+import json
 from datetime import timedelta
 from typing import Optional
 
@@ -8,7 +9,8 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy.orm import Session
 
 from admin.db import get_db
-from admin.models import Account, ApiKey, UsageLog
+from admin.config import settings
+from admin.models import Account, ApiKey, UsageLog, UsageLogDetail
 from admin.security import require_admin
 
 router = APIRouter(prefix="/api/logs", tags=["logs"])
@@ -26,10 +28,14 @@ def list_logs(
     client_ip: Optional[str] = None,
     start: Optional[str] = None,  # 起始时间 YYYY-MM-DD HH:MM:SS
     end: Optional[str] = None,
+    only_error: bool = False,     # 只看失败/异常记录（error_kind 非空且非 success）
     _: bool = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     q = db.query(UsageLog)
+    if only_error:
+        q = q.filter(UsageLog.error_kind.isnot(None), UsageLog.error_kind != "",
+                     UsageLog.error_kind != "success")
     if key_id:
         q = q.filter(UsageLog.api_key_id == key_id)
     if account_id:
@@ -82,11 +88,61 @@ def list_logs(
             "ttfb_ms": r.ttfb_ms,
             "latency_ms": r.latency_ms,
             "error_kind": r.error_kind or "",
+            "http_status": r.http_status if r.http_status is not None else "",
+            "request_preview": r.request_preview or "",
+            "response_preview": r.response_preview or "",
             "created_at": r.created_at.isoformat() if r.created_at else None,
         }
         for r in rows
     ]
     return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+@router.get("/{log_id}/detail")
+def log_detail(
+    log_id: int,
+    raw: bool = False,      # raw=1 时额外返回原始请求/响应报文
+    _: bool = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """返回某次调用的完整上下文：系统提示、多轮历史、工具调用、模型输出。
+
+    弹窗展示用。原始报文（raw_request / raw_response）体积较大，按需返回。
+    """
+    row = db.query(UsageLogDetail).filter(UsageLogDetail.log_id == log_id).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="该调用没有记录完整上下文（可能已被清理或功能未开启）")
+    try:
+        detail = json.loads(row.payload_json) if row.payload_json else {}
+    except Exception:
+        detail = {"messages": [], "output": "", "_parse_error": True}
+    detail["id"] = row.id
+    detail["log_id"] = log_id
+    detail["size_bytes"] = row.size_bytes or 0
+    detail["created_at"] = row.created_at.isoformat() if row.created_at else None
+    if raw:
+        detail["raw_request"] = row.raw_request or ""
+        detail["raw_response"] = row.raw_response or ""
+    return detail
+
+
+@router.delete("/cleanup")
+def cleanup_details(
+    before: Optional[str] = None,   # YYYY-MM-DD，清理该日期之前的完整上下文
+    _: bool = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """清理完整上下文详情，释放磁盘（不影响 usage_logs 主记录）。"""
+    from datetime import datetime as _dt
+    q = db.query(UsageLogDetail)
+    if before:
+        try:
+            q = q.filter(UsageLogDetail.created_at < _dt.strptime(before, "%Y-%m-%d"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="日期格式应为 YYYY-MM-DD")
+    n = q.delete(synchronize_session=False)
+    db.commit()
+    return {"deleted": n}
 
 
 @router.get("/export")
@@ -129,7 +185,7 @@ def export_logs(
     buf.write("﻿")  # UTF-8 BOM，保证 Excel 正确识别中文
     w = csv.writer(buf)
     w.writerow(["ID", "Key", "账号", "模型", "积分", "提示tokens", "补全tokens", "缓存tokens", "总tokens",
-                "TTFB(ms)", "总耗时(ms)", "结果", "客户端IP", "用途", "时间(北京)"])
+                "TTFB(ms)", "总耗时(ms)", "HTTP状态", "结果", "客户端IP", "用途", "输入", "输出", "时间(北京)"])
     for r in rows:
         t = r.created_at
         t_str = ""
@@ -148,9 +204,12 @@ def export_logs(
             r.total_tokens if r.total_tokens is not None else "",
             r.ttfb_ms if r.ttfb_ms is not None else "",
             r.latency_ms if r.latency_ms is not None else "",
+            r.http_status if r.http_status is not None else "",
             r.error_kind or "",
             r.client_ip or "",
             r.use_case or "",
+            r.request_preview or "",
+            r.response_preview or "",
             t_str,
         ])
     return Response(

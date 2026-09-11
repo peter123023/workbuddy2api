@@ -68,6 +68,19 @@ class Settings:
     # 账号选择策略：remain（剩余最多优先）/ lru（最久未用优先）
     ACCOUNT_SELECT = os.getenv("ADMIN_ACCOUNT_SELECT", "remain")
 
+    # 请求级表格日志里「输入 / 输出」预览的截断长度（字符数）。
+    # 0 = 不打印输入输出（只保留原来的指标列）；默认 48。
+    LOG_PREVIEW = int(os.getenv("ADMIN_LOG_PREVIEW", "48"))
+    # 管理后台日志列表存储的对话预览最大长度（0 = 不记录内容）
+    LOG_STORE = int(os.getenv("ADMIN_LOG_STORE", "1000"))
+    # 是否记录完整上下文（系统提示 / 多轮历史 / 工具调用 / 原始报文），1 = 开启
+    LOG_FULL = os.getenv("ADMIN_LOG_FULL", "1").strip() not in ("0", "false", "False", "no")
+    # 单条完整上下文最大字节，超出部分截断（防止极端大请求撑爆磁盘）
+    LOG_FULL_MAX = int(os.getenv("ADMIN_LOG_FULL_MAX", str(2 * 1024 * 1024)))
+    # 对话内容保留天数：详情表（完整上下文/原始报文）与主表预览列超过 N 天自动清理。
+    # 只清内容，保留主表指标行；0 = 永不清理。
+    LOG_RETENTION_DAYS = int(os.getenv("ADMIN_LOG_RETENTION_DAYS", "7"))
+
     # 登录防爆破：同一 IP 在窗口内失败超过阈值即锁定一段时间
     LOGIN_MAX_ATTEMPTS = int(os.getenv("ADMIN_LOGIN_MAX_ATTEMPTS", "5"))
     LOGIN_WINDOW_SECONDS = int(os.getenv("ADMIN_LOGIN_WINDOW_SECONDS", "300"))  # 5 分钟窗口

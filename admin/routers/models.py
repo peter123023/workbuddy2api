@@ -249,6 +249,17 @@ async def speed_test(
         Account.status == "active", Account.balance_remain > 0
     ).order_by(Account.balance_remain.desc()).first()
     if not acc:
+        from datetime import datetime as _dt
+        _now = _dt.utcnow()
+        _cooling = db.query(Account).filter(
+            Account.status == "active", Account.balance_remain > 0,
+            Account.cool_until.isnot(None), Account.cool_until > _now,
+        ).first()
+        if _cooling:
+            _left = int((_cooling.cool_until - _now).total_seconds())
+            raise HTTPException(
+                status_code=503,
+                detail=f"无可用账号（账号冷却中：{_cooling.name} / {_cooling.cool_kind or 'cool'}，剩余 {_left} 秒）")
         raise HTTPException(status_code=503, detail="无可用账号（全部禁用或额度耗尽）")
 
     sess = backend.AccountSession(acc.auth_json)

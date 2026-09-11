@@ -109,11 +109,65 @@ def _run_one(s: Schedule, db, now: datetime):
     db.commit()
 
 
+def cleanup_log_content(retention_days: int) -> dict:
+    """清理超过保留期的对话内容（默认 7 天）。
+
+    - usage_log_details：整行删除（完整上下文 / 原始报文，磁盘大头）
+    - usage_logs.request_preview / response_preview：置 NULL（保留指标行）
+    返回清理量摘要，供日志与调度器记录。
+    """
+    from admin.config import settings
+    from admin.models import UsageLog, UsageLogDetail
+
+    cutoff = datetime.utcnow() - timedelta(days=retention_days)
+    db = SessionLocal()
+    try:
+        n_detail = db.query(UsageLogDetail).filter(UsageLogDetail.created_at < cutoff).delete(
+            synchronize_session=False)
+        n_prev = (db.query(UsageLog)
+                  .filter(UsageLog.created_at < cutoff)
+                  .filter((UsageLog.request_preview.isnot(None)) | (UsageLog.response_preview.isnot(None)))
+                  .update({UsageLog.request_preview: None, UsageLog.response_preview: None},
+                          synchronize_session=False))
+        db.commit()
+        if n_detail or n_prev:
+            print(f"[log-cleanup] 已清理 {cutoff:%Y-%m-%d %H:%M} 之前的对话内容："
+                  f"详情 {n_detail} 条，预览 {n_prev} 条", flush=True)
+        return {"task": "cleanup_log_content", "cutoff": cutoff.isoformat(),
+                "details_deleted": n_detail, "previews_cleared": n_prev}
+    except Exception as e:
+        db.rollback()
+        return {"task": "cleanup_log_content", "error": str(e)}
+    finally:
+        db.close()
+
+
+_retention_last_run: datetime | None = None
+_RETENTION_INTERVAL_HOURS = 6  # 每天查 4 次，足够及时；清理本身按天为粒度
+
+
+def _maybe_run_retention(now: datetime):
+    """在调度循环里按固定间隔触发内容清理（首个周期立即执行一次）。"""
+    global _retention_last_run
+    from admin.config import settings
+    days = getattr(settings, "LOG_RETENTION_DAYS", 7)
+    if not days or days < 0:  # 0 = 关闭
+        return
+    if (_retention_last_run is None
+            or now - _retention_last_run >= timedelta(hours=_RETENTION_INTERVAL_HOURS)):
+        _retention_last_run = now
+        try:
+            cleanup_log_content(days)
+        except Exception as e:  # 清理失败不影响调度
+            print(f"[log-cleanup] 执行失败: {e}", flush=True)
+
+
 def _loop():
     while True:
         try:
             db = SessionLocal()
             now = datetime.utcnow()
+            _maybe_run_retention(now)
             for s in db.query(Schedule).filter(Schedule.enabled == 1).all():
                 if s.next_run_at is None or s.next_run_at <= now:
                     _run_one(s, db, now)

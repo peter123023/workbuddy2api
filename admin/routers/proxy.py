@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from admin import backend
 from admin.config import settings
 from admin.db import SessionLocal, get_db
-from admin.models import Account, ApiKey, ModelConfig, UsageLog
+from admin.models import Account, ApiKey, ModelConfig, UsageLog, UsageLogDetail
 from admin.routers.models import _is_model_allowed
 from admin.security import check_quota, get_key_row
 
@@ -96,7 +96,10 @@ def _record_usage(key_id: int, account_id: int, model: str, credits: float | Non
                   completion_tokens: int | None = None, total_tokens: int | None = None,
                   cached_tokens: int | None = None,
                   seq: int = 0, ttfb_ms: int | None = None,
-                  latency_ms: int | None = None, error_kind: str = "") -> int | None:
+                  latency_ms: int | None = None, error_kind: str = "",
+                  http_status: int | None = None,
+                  req_preview: str = "", resp_preview: str = "",
+                  full_payload=None, full_response: str = "") -> int | None:
     """流式响应结束后独立开一个 DB 会话写入用量/额度。
 
     关键点：请求作用域的 db 会话在端点返回 StreamingResponse 时已被依赖 teardown 关闭，
@@ -147,10 +150,15 @@ def _record_usage(key_id: int, account_id: int, model: str, credits: float | Non
                 total_tokens=total_tokens, cached_tokens=cached_tokens,
                 client_ip=client_ip or "", use_case=use_case or "",
                 seq=seq, ttfb_ms=ttfb_ms, latency_ms=latency_ms, error_kind=error_kind or "",
+                http_status=http_status,
+                request_preview=req_preview or None, response_preview=resp_preview or None,
             )
             db.add(log)
             db.commit()
             log_id = log.id
+            # 完整上下文（系统提示 / 多轮历史 / 工具调用 / 原始报文）单独落详情表
+            if full_payload is not None or full_response:
+                _save_detail(log_id, full_payload, full_response)
             if estimated and account_id and updated_auth_json:
                 threading.Thread(
                     target=_fetch_real_credits,
@@ -231,8 +239,396 @@ import itertools
 _CHAT_SEQ = itertools.count(1)
 
 
-def _log_chat_row(ttfb_ms, latency_ms, model, mode, uid, status, toks, error_kind=""):
-    """向 stdout 打印一行表格日志，便于排查慢请求与风控。"""
+def _content_to_text(content) -> str:
+    """把 message.content（字符串 / 多模态数组）压成纯文本。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for p in content:
+            if isinstance(p, str):
+                parts.append(p)
+            elif isinstance(p, dict):
+                t = p.get("text") or p.get("content") or ""
+                if isinstance(t, str):
+                    parts.append(t)
+        return " ".join(parts)
+    return ""
+
+
+# agent 类客户端（Codex / Claude Code / WorkBuddy）会把运行环境说明塞进 user 消息，
+# 形如 <additional_data>...</additional_data>，直接预览会淹没真正的提问，这里先剥掉。
+_AGENT_BLOCK_TAGS = (
+    "additional_data", "environment", "system-reminder", "system_reminder",
+    "context", "instructions", "background", "functions", "tool_calls",
+)
+_ENV_BLOCK_RE = re.compile(
+    r"<(" + "|".join(_AGENT_BLOCK_TAGS) + r")\b[^>]*>.*?</\1\s*>",
+    re.S | re.I,
+)
+# 兜底：无论标签名，剥掉开头那一段 <tag>...</tag>
+_LEADING_BLOCK_RE = re.compile(r"^\s*<([A-Za-z_][\w:-]*)\b[^>]*>.*?</\1\s*>\s*", re.S)
+# Claude Code / Codex 等客户端注入的方括号式提示，形如 [System reminder: ...]
+_BRACKET_REMINDER_RE = re.compile(r"\[\s*System\s*[Rr]eminder:[^\]]*\]", re.S)
+
+
+def _strip_env_blocks(text: str) -> str:
+    """去掉 agent 运行时注入的环境块，只留下人类真正写的内容。"""
+    s = _BRACKET_REMINDER_RE.sub("", text or "")
+    for _ in range(5):
+        new = _LEADING_BLOCK_RE.sub("", _ENV_BLOCK_RE.sub("", s))
+        if new == s:
+            break
+        s = new
+    return s
+
+
+def _last_user_text(items) -> str:
+    """从消息数组里取最后一条 user 消息的纯文本。
+
+    同时兼容两种形态：
+      - Chat Completions：messages=[{role, content}]
+      - Responses：input=[{role, content:[{type:input_text,text}]}] 或纯字符串数组
+    """
+    if not isinstance(items, list):
+        return ""
+    for m in reversed(items):
+        if isinstance(m, dict) and m.get("role") == "user":
+            t = _content_to_text(m.get("content"))
+            if t:
+                return t
+    # 没有 role 标记（部分 Responses 客户端）时退化为取最后一条有内容的
+    for m in reversed(items):
+        if isinstance(m, dict):
+            t = _content_to_text(m.get("content") or m.get("text"))
+            if t:
+                return t
+        elif isinstance(m, str) and m.strip():
+            return m
+    return ""
+
+
+def _extract_input(payload) -> str:
+    """从请求体里取「用户输入」：优先最后一条 user 消息，兼容 Responses 的 input。"""
+    if not isinstance(payload, dict):
+        return ""
+    raw = _last_user_text(payload.get("messages"))
+    if not raw:
+        inp = payload.get("input")
+        # Responses 的 input 可能是字符串，也可能是消息数组
+        raw = _last_user_text(inp) if isinstance(inp, list) else _content_to_text(inp)
+    stripped = _strip_env_blocks(raw).strip()
+    return stripped or raw
+
+
+def _extract_output(sse_text: str) -> str:
+    """从上游 SSE 原文里拼出「模型输出」。
+
+    同时兼容两种协议：
+      - Chat Completions：choices[0].delta.content / choices[0].message.content
+      - Responses：type=response.output_text.delta 的 delta 字段
+    """
+    buf: list[str] = []
+    reason: list[str] = []
+    errs: list[str] = []
+    for line in (sse_text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        # 上游限流/业务错误常在 HTTP 200 的 SSE 流里以 error 字段返回，
+        # 必须一并捕获，否则这类失败在日志里表现为「空回复」。
+        err = obj.get("error")
+        if isinstance(err, dict):
+            msg = err.get("message") or err.get("msg") or ""
+            if msg:
+                errs.append(str(msg))
+            continue
+        elif isinstance(err, str) and err.strip():
+            errs.append(err.strip())
+            continue
+        # Responses 协议
+        if str(obj.get("type") or "").startswith("response.output_text.delta"):
+            d = obj.get("delta")
+            if isinstance(d, str):
+                buf.append(d)
+            continue
+        # Chat Completions 协议
+        try:
+            choice = (obj.get("choices") or [{}])[0]
+            delta = choice.get("delta") or {}
+            t = delta.get("content")
+            if t:
+                buf.append(t)
+            # 思考型模型可能只回 reasoning_content，正文为空时用它兜底
+            rc = delta.get("reasoning_content")
+            if rc:
+                reason.append(rc)
+            msg = choice.get("message") or {}
+            if not t and msg.get("content"):
+                buf.append(msg["content"])
+        except Exception:
+            continue
+    out = "".join(buf)
+    if out:
+        return out
+    # 正常正文为空时，优先展示上游错误（限流/配额提示等），其次才是思考内容
+    if errs:
+        return "[上游错误] " + " ".join(dict.fromkeys(errs))
+    if reason:
+        return "[思考] " + "".join(reason)
+    return ""
+
+
+def _preview(text: str, limit: int) -> str:
+    """压平换行并按 limit 截断，超出加省略号。"""
+    s = " ".join((text or "").split())
+    if limit > 0 and len(s) > limit:
+        s = s[:limit] + "..."
+    return s
+
+
+def _store_preview(text: str) -> str:
+    """按 LOG_STORE 截断对话内容用于入库；配置为 0 时不记录正文。"""
+    limit = getattr(settings, "LOG_STORE", 1000)
+    if not limit:
+        return ""
+    return _preview(text, limit)
+
+
+# ---------------------------------------------------------------------------
+# 完整上下文：系统提示 / 多轮历史 / 工具调用 / 模型输出 / 原始报文
+# ---------------------------------------------------------------------------
+
+def _clamp(s: str, max_bytes: int) -> str:
+    """按字节上限截断字符串，避免把 UTF-8 字符切一半导致入库乱码。"""
+    if not s:
+        return ""
+    b = s.encode("utf-8", errors="ignore")
+    if len(b) <= max_bytes:
+        return s
+    return b[:max_bytes].decode("utf-8", errors="ignore") + "\n... [已截断，超出 ADMIN_LOG_FULL_MAX]"
+
+
+def _tool_calls_text(calls) -> str:
+    """把 tool_calls 渲染成可读文本（chat 协议 assistant 消息里的字段）。"""
+    if not isinstance(calls, list):
+        return ""
+    parts = []
+    for c in calls:
+        if not isinstance(c, dict):
+            continue
+        fn = c.get("function") or {}
+        name = fn.get("name") or c.get("name") or "?"
+        args = fn.get("arguments") or c.get("arguments") or ""
+        if not isinstance(args, str):
+            try:
+                args = json.dumps(args, ensure_ascii=False)
+            except Exception:
+                args = str(args)
+        parts.append(f"{name}({args})")
+    return "\n".join(parts)
+
+
+def _norm_message(m) -> dict | None:
+    """把 chat / responses 两种协议的消息项归一成统一结构。
+
+    统一输出：{role, content, tool_calls(文本), name, tool_call_id, kind}
+    """
+    if isinstance(m, str):
+        return {"role": "user", "content": m, "kind": "text"}
+    if not isinstance(m, dict):
+        return None
+    # Responses 协议：带 type 的事件项
+    mtype = str(m.get("type") or "")
+    role = m.get("role") or ""
+    if mtype == "function_call" or mtype == "tool_call":
+        return {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": _tool_calls_text([m]),
+            "kind": "tool_call",
+            "tool_call_id": m.get("call_id") or m.get("id") or "",
+        }
+    if mtype == "function_call_output" or mtype == "tool_result":
+        return {
+            "role": "tool",
+            "content": _content_to_text(m.get("output") if m.get("output") is not None else m.get("content")),
+            "kind": "tool_result",
+            "tool_call_id": m.get("call_id") or m.get("tool_call_id") or "",
+        }
+    content = _content_to_text(m.get("content"))
+    tc = _tool_calls_text(m.get("tool_calls")) if m.get("tool_calls") else ""
+    if not content and not tc and not role:
+        return None
+    return {
+        "role": role or ("assistant" if tc else "user"),
+        "content": content,
+        "tool_calls": tc,
+        "name": m.get("name") or "",
+        "tool_call_id": m.get("tool_call_id") or "",
+        "kind": "tool_call" if tc and not content else ("tool_result" if role == "tool" else "text"),
+    }
+
+
+def _dump_messages(payload) -> list[dict]:
+    """抽取完整提示词上下文：系统提示 + 多轮历史 + 工具调用与结果。"""
+    out: list[dict] = []
+    if not isinstance(payload, dict):
+        return out
+    # Responses 协议的 instructions / system 等价于 system prompt
+    for key in ("instructions", "system"):
+        v = payload.get(key)
+        if isinstance(v, str) and v.strip():
+            out.append({"role": "system", "content": v, "kind": "text"})
+    items = None
+    if isinstance(payload.get("messages"), list):
+        items = payload["messages"]
+    elif isinstance(payload.get("input"), list):
+        items = payload["input"]
+    elif isinstance(payload.get("input"), str):
+        out.append({"role": "user", "content": payload["input"], "kind": "text"})
+    for m in (items or []):
+        n = _norm_message(m)
+        if n:
+            out.append(n)
+    return out
+
+
+def _scan_response(sse_text: str) -> dict:
+    """扫描上游完整响应，拆出 正文 / 思考 / 工具调用 / usage。
+
+    同时兼容 Chat Completions 与 Responses 两种 SSE 协议。
+    """
+    out: list[str] = []
+    reason: list[str] = []
+    calls: dict[int, dict] = {}
+    usage: dict | None = None
+    for line in (sse_text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        body = line[len("data:"):].strip()
+        if not body or body == "[DONE]":
+            continue
+        try:
+            obj = json.loads(body)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        try:
+            if isinstance(obj.get("usage"), dict):
+                usage = obj["usage"]
+            # ---- Responses 协议 ----
+            t = str(obj.get("type") or "")
+            if t == "response.output_text.delta" and isinstance(obj.get("delta"), str):
+                out.append(obj["delta"])
+            elif t in ("response.reasoning_text.delta", "response.reasoning.delta") and isinstance(obj.get("delta"), str):
+                reason.append(obj["delta"])
+            elif t == "response.output_item.added":
+                item = obj.get("item") or {}
+                if item.get("type") in ("function_call", "tool_call"):
+                    idx = len(calls)
+                    calls[idx] = {
+                        "name": item.get("name") or "?",
+                        "arguments": item.get("arguments") or "",
+                        "id": item.get("call_id") or item.get("id") or "",
+                    }
+            elif t == "response.function_call_arguments.delta" and isinstance(obj.get("delta"), str) and calls:
+                calls[max(calls.keys())]["arguments"] += obj["delta"]
+            elif t == "response.completed":
+                resp = obj.get("response") or {}
+                if isinstance(resp.get("usage"), dict):
+                    usage = resp["usage"]
+            # ---- Chat Completions 协议 ----
+            ch = (obj.get("choices") or [])
+            if ch:
+                c0 = ch[0] if isinstance(ch[0], dict) else {}
+                delta = c0.get("delta") or {}
+                if isinstance(delta.get("content"), str):
+                    out.append(delta["content"])
+                if isinstance(delta.get("reasoning_content"), str):
+                    reason.append(delta["reasoning_content"])
+                for tc in (delta.get("tool_calls") or []):
+                    if not isinstance(tc, dict):
+                        continue
+                    idx = tc.get("index") or 0
+                    cur = calls.setdefault(idx, {"name": "", "arguments": "", "id": ""})
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        cur["name"] = fn["name"]
+                    if tc.get("id"):
+                        cur["id"] = tc["id"]
+                    if fn.get("arguments"):
+                        cur["arguments"] += fn["arguments"]
+                msg = c0.get("message") or {}
+                if isinstance(msg.get("content"), str) and msg["content"] and not out:
+                    out.append(msg["content"])
+        except Exception:
+            continue
+    return {
+        "output": "".join(out),
+        "reasoning": "".join(reason),
+        "tool_calls": [calls[k] for k in sorted(calls)],
+        "usage": usage,
+    }
+
+
+def _build_detail(payload, resp_text: str) -> dict:
+    """组装完整上下文（供后台弹窗展示）。"""
+    scanned = _scan_response(resp_text)
+    return {
+        "messages": _dump_messages(payload),
+        "output": scanned["output"],
+        "reasoning": scanned["reasoning"],
+        "tool_calls": scanned["tool_calls"],
+        "usage": scanned["usage"],
+    }
+
+
+def _save_detail(log_id: int | None, payload, resp_text: str) -> None:
+    """把完整上下文写入 usage_log_details（失败不影响主流程）。"""
+    if not log_id or not getattr(settings, "LOG_FULL", True):
+        return
+    max_bytes = getattr(settings, "LOG_FULL_MAX", 2 * 1024 * 1024)
+    try:
+        detail = _build_detail(payload, resp_text)
+        payload_json = json.dumps(detail, ensure_ascii=False)
+        try:
+            raw_req = json.dumps(payload, ensure_ascii=False) if isinstance(payload, dict) else str(payload)
+        except Exception:
+            raw_req = str(payload)
+        db = SessionLocal()
+        try:
+            db.add(UsageLogDetail(
+                log_id=log_id,
+                payload_json=_clamp(payload_json, max_bytes),
+                raw_request=_clamp(raw_req, max_bytes),
+                raw_response=_clamp(resp_text or "", max_bytes),
+                size_bytes=len(payload_json.encode("utf-8", errors="ignore")),
+            ))
+            db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        _logger.warning("写入完整上下文失败 log=%s: %s", log_id, e)
+
+
+def _log_chat_row(ttfb_ms, latency_ms, model, mode, uid, status, toks, error_kind="",
+                  prompt_text: str = "", output_text: str = ""):
+    """向 stdout 打印一行表格日志，便于排查慢请求与风控。
+
+    ADMIN_LOG_PREVIEW > 0 时在末尾追加 输入 / 输出 两列（截断预览）。
+    """
     seq = next(_CHAT_SEQ)
     now = datetime.now().strftime("%H:%M:%S")
     model = (model or "-")[:11]
@@ -243,7 +639,12 @@ def _log_chat_row(ttfb_ms, latency_ms, model, mode, uid, status, toks, error_kin
     ttfb = "-" if ttfb_ms is None or ttfb_ms <= 0 else f"{ttfb_ms}ms"
     uid_prefix = (uid or "-")[:8]
     latency = f"{latency_ms}ms" if latency_ms is not None else "-"
-    print(f"| #{seq:03d} | {now} | {model:11s} | {mode:6s} | {status:3d} | uid={uid_prefix} | TTFB={ttfb:>5} | tok={tok_field:>5} | {tps:>6}t/s | total={latency:>7} | {error_kind}", flush=True)
+    row = (f"| #{seq:03d} | {now} | {model:11s} | {mode:6s} | {status:3d} | uid={uid_prefix} "
+           f"| TTFB={ttfb:>5} | tok={tok_field:>5} | {tps:>6}t/s | total={latency:>7} | {error_kind}")
+    limit = getattr(settings, "LOG_PREVIEW", 48)
+    if limit > 0:
+        row += f' | in="{_preview(prompt_text, limit)}" | out="{_preview(output_text, limit)}"'
+    print(row, flush=True)
     return seq
 
 
@@ -401,6 +802,145 @@ def _select_account(db: Session, exclude_ids: set | None = None,
         db.commit()
     return acc
 
+
+def _no_account_reason(db: Session) -> str:
+    """当 _select_account 返回 None 时，给出人能看懂的真实原因。
+
+    原文案固定写「全部禁用或额度耗尽」，但最常见的其实是「冷却中」——
+    账号被上游限流（soft_rate）后 60 秒内不可选，此时其它模型也会被一起挡掉，
+    却被告知「额度耗尽」，排查时极易误判。
+    """
+    now = datetime.utcnow()
+    total = db.query(Account).count()
+    if total == 0:
+        return "账号池为空，请先在「账号管理」添加账号"
+    if db.query(Account).filter(Account.status == "active").count() == 0:
+        return "全部账号已禁用"
+    if db.query(Account).filter(Account.status == "active",
+                                Account.balance_remain > 0).count() == 0:
+        return "全部账号额度耗尽"
+    cooling = db.query(Account).filter(
+        Account.status == "active", Account.balance_remain > 0,
+        Account.cool_until.isnot(None), Account.cool_until > now,
+    ).all()
+    if cooling:
+        parts = []
+        for a in cooling[:3]:
+            left = int((a.cool_until - now).total_seconds())
+            parts.append(f"{a.name}:{a.cool_kind or 'cool'} 剩余{left}s")
+        return "账号冷却中（" + "，".join(parts) + "），冷却结束后自动恢复"
+    return "账号暂不可用（防撞号窗口内刚被占用）"
+
+def _readable_upstream(text: str) -> str:
+    """把上游错误原文转成可直接展示的中文；解析失败则原样返回（截断）。
+
+    上游业务错误多为 JSON（含 code/msg 字段），若直接把整段 JSON 甩给客户端，
+    会被拆成多块、且看不清真实原因。这里优先提取 msg/message 字段。
+    """
+    if not text:
+        return ""
+    s = text.strip()
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            for k in ("msg", "message", "error_msg", "errmsg", "errorMessage"):
+                v = obj.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            if isinstance(obj.get("error"), dict):
+                ev = obj["error"].get("message")
+                if isinstance(ev, str) and ev.strip():
+                    return ev.strip()
+    except Exception:
+        pass
+    return s[:300]
+
+    return s[:300]
+
+
+async def _try_open_upstream(db, order, body, request, url, key, payload, use_case, requested_model):
+    """在流出 SSE 头之前，先尝试打开上游连接并判定本次请求能否成功。
+
+    必要性：Starlette 的 StreamingResponse 一旦开始迭代生成器，HTTP 响应头
+    （status=200）便已发出，之后无论生成器内发生什么都无法再把状态码改成 503。
+    因此把「账号级重试 + 判定上游是否可用」整体前移到 StreamingResponse 构造之前。
+
+    - 若所有账号/候选模型均失败（含上游 6004 限流、账号冷却等），在此写完失败日志，
+      并返回 ("fail", err_kind, err_msg, status)。
+    - 只有当某个候选拿到 status<400 的连接时，才返回 ("ok", client, r, model, acc, sess)，
+      交由调用方以 HTTP 200 流式透传（连接复用，成功路径不额外发请求）。
+    """
+    client = httpx.AsyncClient(timeout=300, limits=backend.HTTP_LIMITS)
+    tried_ids: set = set()
+    last_err_kind = ""
+    last_err_msg = ""
+    last_status = 0
+    request_start = time.perf_counter()
+    try:
+        for m in order:
+            body["model"] = m
+            for _attempt in range(3):
+                acc = _select_account(db, exclude_ids=tried_ids, min_balance=1)
+                if not acc:
+                    break
+                tried_ids.add(acc.id)
+                sess = _account_session_safe(db, acc)
+                if sess is None:
+                    continue
+                headers = sess.get_headers(extra=_upstream_extra_headers(request))
+                try:
+                    r = await client.send(
+                        client.build_request("POST", url, headers=headers, json=body),
+                        stream=True)
+                    if r.status_code >= 400:
+                        detail = await r.aread()
+                        text = (detail[:500].decode(errors="ignore")
+                                if isinstance(detail, bytes) else str(detail)[:500])
+                        kind = _classify_error(r.status_code, text)
+                        _apply_account_policy(db, acc, kind, r.status_code, text)
+                        if kind in ("hard_credit", "session_dead", "soft_rate",
+                                    "not_found", "server"):
+                            last_err_kind, last_err_msg, last_status = kind, text, r.status_code
+                            await r.aclose()
+                            sess.close()
+                            continue
+                        # 不可重试的客户端错误：原样返回上游真实状态码
+                        await r.aclose()
+                        sess.close()
+                        await client.aclose()
+                        return ("fail", kind, text, r.status_code)
+                    # 成功建立连接：保持打开，交由调用方透传
+                    acc.last_used_at = datetime.utcnow()
+                    db.commit()
+                    return ("ok", client, r, m, acc, sess)
+                except Exception as e:
+                    kind = _classify_error(0, str(e))
+                    _apply_account_policy(db, acc, kind, 0, str(e))
+                    if kind == "transport":
+                        last_err_kind, last_err_msg = kind, str(e)
+                        sess.close()
+                        continue
+                    last_err_kind, last_err_msg = kind, str(e)
+                    sess.close()
+                    continue
+        # 全部账号/模型均失败：把上游真实报错（如「使用量已超出频率限制…」）落库，
+        # 否则失败请求在日志里只有提问、没有回复，排查限流时看不到任何线索。
+        latency_ms = int((time.perf_counter() - request_start) * 1000)
+        err_kind = last_err_kind or "no_account"
+        seq = _log_chat_row(None, latency_ms, requested_model, "stream", "-",
+                            (last_status or 503), None, error_kind=err_kind,
+                            prompt_text=_extract_input(payload))
+        _record_usage(key.id, 0, requested_model, 0.0, None,
+                      client_ip=_client_ip(request), use_case=use_case, seq=seq,
+                      latency_ms=latency_ms, error_kind=err_kind,
+                      req_preview=_store_preview(_extract_input(payload)),
+                      resp_preview=_store_preview(last_err_msg),
+                      full_payload=payload, full_response=last_err_msg or "")
+        await client.aclose()
+        return ("fail", err_kind, last_err_msg, last_status)
+    except Exception:
+        await client.aclose()
+        raise
 
 def _pick_best_model(db: Session, requested_model: str) -> str | None:
     """根据请求模型和可用配置，选出最优实际使用的模型 ID。
@@ -568,15 +1108,22 @@ async def chat_completions(
     except Exception as e:
         return JSONResponse(status_code=e.status_code, content=e.detail)
 
-    acc = _select_account(db)
-    if not acc:
-        return JSONResponse(status_code=503,
-                            content={"error": {"message": "无可用账号（全部禁用或额度耗尽）", "type": "no_account"}})
-
     try:
         payload = await request.json()
     except Exception:
         return JSONResponse(status_code=400, content={"error": {"message": "bad json", "type": "invalid_request"}})
+
+    acc = _select_account(db)
+    if not acc:
+        # 无可用账号此前不写日志，后台完全看不到这类失败；这里补记录并写明真实原因
+        reason = _no_account_reason(db)
+        _record_usage(key.id, 0, str(payload.get("model") or "auto"), 0.0, None,
+                      client_ip=_client_ip(request), use_case="chat-completion",
+                      error_kind="no_account", http_status=503,
+                      req_preview=_store_preview(_extract_input(payload)),
+                      resp_preview=_store_preview(reason), full_payload=payload, full_response=reason)
+        return JSONResponse(status_code=503,
+                            content={"error": {"message": f"无可用账号（{reason}）", "type": "no_account"}})
 
     model = payload.get("model", "auto")
 
@@ -604,114 +1151,81 @@ async def chat_completions(
 
     url = f"{settings.BACKEND}/v2/chat/completions"
 
+    # 在流出 SSE 头之前先尝试打开上游连接：若所有账号/候选模型均不可用
+    # （含上游 6004 限流、账号冷却等），直接返回真实 HTTP 503 + 上游中文原话；
+    # 只有拿到 status<400 的连接才进入流式透传（否则一旦发了 HTTP 200 就无法改 503）。
+    opened = await _try_open_upstream(
+        db, order, body, request, url, key, payload, "chat-completion",
+        str(payload.get("model") or "auto"))
+    if opened[0] == "fail":
+        kind, msg, status = opened[1], opened[2], opened[3]
+        readable = _readable_upstream(msg)
+        fail_msg = (f"{readable}（错误类型：{kind}）" if msg else "无可用账号或模型")
+        # 这里此前直接返回 503 而不写日志，导致限流类报错在后台完全看不到；现已补记
+        _record_usage(key.id, 0, str(payload.get("model") or "auto"), 0.0, None,
+                      client_ip=_client_ip(request), use_case="chat-completion",
+                      error_kind=kind, http_status=503,
+                      req_preview=_store_preview(_extract_input(payload)),
+                      resp_preview=_store_preview(readable), full_payload=payload, full_response=msg or "")
+        return JSONResponse(status_code=503,
+                            content={"error": {"message": fail_msg, "type": "no_model_available"}})
+
+    client, upstream_r, final_model, acc_i, sess_i = opened[1], opened[2], opened[3], opened[4], opened[5]
+
     async def _stream():
-        """带账号级重试 + 错误状态机 + 表格日志的流式代理。"""
         db2 = SessionLocal()
         try:
             request_start = time.perf_counter()
             ttfb_at = None
-            status_out = 503
-            seq = None
-            mode = "stream"
-            final_model = resolved_model or model
-            final_acc_id = 0
-            final_uid = "-"
-            total_toks = None
             collected = []
-            delivered = False
-            last_err_kind = ""
-            last_err_msg = ""
-
-            async with httpx.AsyncClient(timeout=300, limits=backend.HTTP_LIMITS) as client:
-                for m in order:
-                    body["model"] = m
-                    tried_ids: set = set()
-                    for attempt in range(3):
-                        acc_i = _select_account(db2, exclude_ids=tried_ids, min_balance=1)
-                        if not acc_i:
-                            break
-                        tried_ids.add(acc_i.id)
-                        sess_i = _account_session_safe(db2, acc_i)
-                        if sess_i is None:
-                            continue
-                        headers_i = sess_i.get_headers(extra=_upstream_extra_headers(request))
-                        try:
-                            async with client.stream("POST", url, headers=headers_i, json=body) as r:
-                                if r.status_code >= 400:
-                                    detail = await r.aread()
-                                    text = detail[:500].decode(errors="ignore") if isinstance(detail, bytes) else str(detail)[:500]
-                                    kind = _classify_error(r.status_code, text)
-                                    _apply_account_policy(db2, acc_i, kind, r.status_code, text)
-                                    # 余额不足 / session 死亡 / 限流 / 上游 5xx / 404 都属于"可重试"，
-                                    # 立即换下一个账号，绝不把中断感传递给客户端。
-                                    if kind in ("hard_credit", "session_dead", "soft_rate", "not_found", "server"):
-                                        last_err_kind = kind
-                                        last_err_msg = text
-                                        sess_i.close()
-                                        continue
-                                    # 不可重试的客户端错误（400/403等）才原样返回
-                                    if not delivered:
-                                        yield text
-                                    sess_i.close()
-                                    return
-                                # 成功连接：标记使用时刻并记录最终信息
-                                final_model = m
-                                final_acc_id = acc_i.id
-                                final_uid = acc_i.uid or "-"
-                                acc_i.last_used_at = datetime.utcnow()
-                                db2.commit()
-                                async for chunk in r.aiter_text():
-                                    if ttfb_at is None:
-                                        ttfb_at = time.perf_counter()
-                                    collected.append(chunk)
-                                    delivered = True
-                                    yield chunk
-                            # 流式完成 → 记账 / 表格日志
-                            text = "".join(collected)
-                            usage = _parse_usage(text)
-                            total_toks = usage["total_tokens"] or usage["completion_tokens"]
-                            status_out = 200
-                            latency_ms = int((time.perf_counter() - request_start) * 1000)
-                            ttfb_ms = int((ttfb_at - request_start) * 1000) if ttfb_at else None
-                            seq = _log_chat_row(ttfb_ms, latency_ms, final_model, mode, final_uid,
-                                                status_out, total_toks, error_kind="success")
-                            updated = sess_i.updated_json()
-                            sess_i.close()
-                            _record_usage(key.id, final_acc_id, final_model, usage["credits"], updated,
-                                          client_ip=_client_ip(request), use_case="chat-completion",
-                                          prompt_tokens=usage["prompt_tokens"],
-                                          completion_tokens=usage["completion_tokens"],
-                                          total_tokens=usage["total_tokens"],
-                                          cached_tokens=usage["cached_tokens"],
-                                          seq=seq, ttfb_ms=ttfb_ms, latency_ms=latency_ms,
-                                          error_kind="success")
-                            return
-                        except Exception as e:
-                            if delivered:
-                                sess_i.close()
-                                return
-                            kind = _classify_error(0, str(e))
-                            _apply_account_policy(db2, acc_i, kind, 0, str(e))
-                            # 网络/传输错误也换号重试
-                            if kind == "transport":
-                                last_err_kind = kind
-                                last_err_msg = str(e)
-                                sess_i.close()
-                                continue
-                            last_err_kind = kind
-                            last_err_msg = str(e)
-                            sess_i.close()
-                            continue
-            # 全部账号/模型均失败
+            async for chunk in upstream_r.aiter_text():
+                if ttfb_at is None:
+                    ttfb_at = time.perf_counter()
+                collected.append(chunk)
+                yield chunk
+            text = "".join(collected)
+            usage = _parse_usage(text)
+            status_out = 200
             latency_ms = int((time.perf_counter() - request_start) * 1000)
-            err_kind = last_err_kind or ("no_account" if not last_err_msg else "transport")
-            seq = _log_chat_row(None, latency_ms, final_model, mode, "-", status_out, None, error_kind=err_kind)
-            _record_usage(key.id, 0, final_model, 0.0, None,
-                          client_ip=_client_ip(request), use_case="chat-completion", seq=seq, latency_ms=latency_ms,
-                          error_kind=err_kind)
-            err_msg = f"所有账号/候选模型均不可用（最后错误：{last_err_kind}）" if last_err_kind else "无可用账号或模型"
-            yield f"data: {json.dumps({'error': {'message': err_msg, 'type': 'no_model_available'}}, ensure_ascii=False)}\n\n"
+            ttfb_ms = int((ttfb_at - request_start) * 1000) if ttfb_at else None
+            seq = _log_chat_row(ttfb_ms, latency_ms, final_model, "stream", acc_i.uid or "-",
+                                status_out, usage["total_tokens"] or usage["completion_tokens"],
+                                error_kind="success", prompt_text=_extract_input(payload),
+                                output_text=_extract_output(text))
+            updated = sess_i.updated_json()
+            sess_i.close()
+            _record_usage(key.id, acc_i.id, final_model, usage["credits"], updated,
+                          client_ip=_client_ip(request), use_case="chat-completion",
+                          prompt_tokens=usage["prompt_tokens"],
+                          completion_tokens=usage["completion_tokens"],
+                          total_tokens=usage["total_tokens"],
+                          cached_tokens=usage["cached_tokens"],
+                          seq=seq, ttfb_ms=ttfb_ms, latency_ms=latency_ms,
+                          error_kind="success", http_status=200,
+                          req_preview=_store_preview(_extract_input(payload)),
+                          resp_preview=_store_preview(_extract_output(text)),
+                          full_payload=payload, full_response=text)
+        except Exception as e:
+            latency_ms = int((time.perf_counter() - request_start) * 1000)
+            ttfb_ms = int((ttfb_at - request_start) * 1000) if ttfb_at else None
+            err_text = str(e)
+            seq = _log_chat_row(ttfb_ms, latency_ms, final_model, "stream", acc_i.uid or "-",
+                                200, None, error_kind="transport", prompt_text=_extract_input(payload))
+            _record_usage(key.id, acc_i.id, final_model, 0.0, None,
+                          client_ip=_client_ip(request), use_case="chat-completion", seq=seq,
+                          latency_ms=latency_ms, error_kind="transport", http_status=200,
+                          req_preview=_store_preview(_extract_input(payload)),
+                          resp_preview=_store_preview(err_text),
+                          full_payload=payload, full_response=err_text)
         finally:
+            try:
+                await upstream_r.aclose()
+            except Exception:
+                pass
+            try:
+                await client.aclose()
+            except Exception:
+                pass
             db2.close()
 
     return StreamingResponse(_stream(), media_type="text/event-stream",
@@ -822,7 +1336,9 @@ async def responses_proxy(
                             db2.commit()
                             updated = sess_i.updated_json()
                             total_toks = cost_info["total_tokens"] or cost_info["completion_tokens"]
-                            seq = _log_chat_row(None, None, m, "resp", acc_i.uid or "-", 200, total_toks, error_kind="success")
+                            seq = _log_chat_row(None, None, m, "resp", acc_i.uid or "-", 200, total_toks,
+                                                error_kind="success", prompt_text=_extract_input(payload),
+                                                output_text=_extract_output(r.text))
                             sess_i.close()
                             _record_usage(key.id, acc_i.id, m, cost_info["credits"], updated,
                                           client_ip=_client_ip(request), use_case="responses",
@@ -830,121 +1346,109 @@ async def responses_proxy(
                                           completion_tokens=cost_info["completion_tokens"],
                                           total_tokens=cost_info["total_tokens"],
                                           cached_tokens=cost_info["cached_tokens"],
-                                          seq=seq, error_kind="success")
+                                          seq=seq, error_kind="success", http_status=200,
+                                          req_preview=_store_preview(_extract_input(payload)),
+                                          resp_preview=_store_preview(_extract_output(r.text)),
+                                          full_payload=payload, full_response=r.text)
                             return JSONResponse(content=obj)
                     except Exception as e:
                         kind = _classify_error(0, str(e))
                         _apply_account_policy(db2, acc_i, kind, 0, str(e))
                         sess_i.close()
                         continue
-            seq = _log_chat_row(None, None, resolved, "resp", "-", 503, None, error_kind="no_account")
+            reason = _no_account_reason(db2)
+            seq = _log_chat_row(None, None, resolved, "resp", "-", 503, None,
+                                error_kind="no_account", prompt_text=_extract_input(payload))
             _record_usage(key.id, 0, resolved, 0.0, None,
-                          client_ip=_client_ip(request), use_case="responses", seq=seq, error_kind="no_account")
+                          client_ip=_client_ip(request), use_case="responses", seq=seq,
+                          error_kind="no_account", http_status=503,
+                          req_preview=_store_preview(_extract_input(payload)),
+                          full_payload=payload)
             return JSONResponse(status_code=503,
-                                content={"error": {"message": "所有账号/候选模型均不可用", "type": "no_model_available"}})
+                                content={"error": {"message": f"无可用账号（{reason}）", "type": "no_account"}})
+
         finally:
             db2.close()
+
+    opened = await _try_open_upstream(
+        db, order, chat_body, request, url, key, payload, "responses",
+        str(payload.get("model") or "auto"))
+    if opened[0] == "fail":
+        kind, msg, status = opened[1], opened[2], opened[3]
+        readable = _readable_upstream(msg)
+        fail_msg = (f"{readable}（错误类型：{kind}）" if msg else "无可用账号或模型")
+        # 这里此前直接返回 503 而不写日志，导致限流类报错在后台完全看不到；现已补记
+        _record_usage(key.id, 0, str(payload.get("model") or "auto"), 0.0, None,
+                      client_ip=_client_ip(request), use_case="responses",
+                      error_kind=kind, http_status=503,
+                      req_preview=_store_preview(_extract_input(payload)),
+                      resp_preview=_store_preview(readable), full_payload=payload, full_response=msg or "")
+        return JSONResponse(status_code=503,
+                            content={"error": {"message": fail_msg, "type": "no_model_available"}})
+
+    client, upstream_r, final_model, acc_i, sess_i = opened[1], opened[2], opened[3], opened[4], opened[5]
 
     async def _stream():
         db2 = SessionLocal()
         try:
             request_start = time.perf_counter()
             ttfb_at = None
-            seq = None
-            final_model = resolved
-            final_acc_id = 0
-            final_uid = "-"
-            total_toks = None
-            raw_lines: list[str] = []
-            delivered = False
-            last_err_kind = ""
-            last_err_msg = ""
-
-            async with httpx.AsyncClient(timeout=300, limits=backend.HTTP_LIMITS) as client:
-                for m in order:
-                    body = dict(chat_body)
-                    body["model"] = m
-                    tried_ids: set = set()
-                    for _ in range(3):
-                        acc_i = _select_account(db2, exclude_ids=tried_ids, min_balance=1)
-                        if not acc_i:
-                            break
-                        tried_ids.add(acc_i.id)
-                        sess_i = _account_session_safe(db2, acc_i)
-                        if sess_i is None:
-                            continue
-                        headers_i = sess_i.get_headers(extra=_upstream_extra_headers(request))
-                        converter = ResponsesStreamConverter(model=model_name)
-                        try:
-                            async with client.stream("POST", url, headers=headers_i, json=body) as r:
-                                if r.status_code >= 400:
-                                    detail = await r.aread()
-                                    text = detail[:500].decode(errors="ignore") if isinstance(detail, bytes) else str(detail)[:500]
-                                    kind = _classify_error(r.status_code, text)
-                                    _apply_account_policy(db2, acc_i, kind, r.status_code, text)
-                                    if kind in ("hard_credit", "session_dead", "soft_rate", "not_found", "server"):
-                                        last_err_kind = kind
-                                        last_err_msg = text
-                                        sess_i.close()
-                                        continue
-                                    yield f"data: {json.dumps({'type': 'error', 'error': {'message': text, 'code': r.status_code}}, ensure_ascii=False)}\n\n"
-                                    sess_i.close()
-                                    return
-                                final_model = m
-                                final_acc_id = acc_i.id
-                                final_uid = acc_i.uid or "-"
-                                acc_i.last_used_at = datetime.utcnow()
-                                db2.commit()
-                                async for line in r.aiter_lines():
-                                    if not line.strip():
-                                        continue
-                                    if ttfb_at is None:
-                                        ttfb_at = time.perf_counter()
-                                    events = converter.feed_line(line)
-                                    if events:
-                                        delivered = True
-                                        yield events
-                                    raw_lines.append(line)
-                            finish = converter.finish()
-                            if finish:
-                                delivered = True
-                                yield finish
-                            text = "\n".join(raw_lines)
-                            usage = _parse_usage(text)
-                            total_toks = usage["total_tokens"] or usage["completion_tokens"]
-                            latency_ms = int((time.perf_counter() - request_start) * 1000)
-                            ttfb_ms = int((ttfb_at - request_start) * 1000) if ttfb_at else None
-                            seq = _log_chat_row(ttfb_ms, latency_ms, final_model, "resp", final_uid, 200, total_toks, error_kind="success")
-                            updated = sess_i.updated_json()
-                            sess_i.close()
-                            _record_usage(key.id, final_acc_id, final_model, usage["credits"], updated,
-                                          client_ip=_client_ip(request), use_case="responses",
-                                          prompt_tokens=usage["prompt_tokens"],
-                                          completion_tokens=usage["completion_tokens"],
-                                          total_tokens=usage["total_tokens"],
-                                          cached_tokens=usage["cached_tokens"],
-                                          seq=seq, ttfb_ms=ttfb_ms, latency_ms=latency_ms,
-                                          error_kind="success")
-                            return
-                        except Exception as e:
-                            if delivered:
-                                sess_i.close()
-                                return
-                            kind = _classify_error(0, str(e))
-                            _apply_account_policy(db2, acc_i, kind, 0, str(e))
-                            if kind == "transport":
-                                last_err_kind = kind
-                                last_err_msg = str(e)
-                            sess_i.close()
-                            continue
+            raw_lines = []
+            converter = ResponsesStreamConverter(model=model_name)
+            async for line in upstream_r.aiter_lines():
+                if not line.strip():
+                    continue
+                if ttfb_at is None:
+                    ttfb_at = time.perf_counter()
+                events = converter.feed_line(line)
+                if events:
+                    yield events
+                raw_lines.append(line)
+            finish = converter.finish()
+            if finish:
+                yield finish
+            text = "\n".join(raw_lines)
+            usage = _parse_usage(text)
             latency_ms = int((time.perf_counter() - request_start) * 1000)
-            err_kind = last_err_kind or "no_account"
-            seq = _log_chat_row(None, latency_ms, final_model, "resp", "-", 503, None, error_kind=err_kind)
-            _record_usage(key.id, 0, final_model, 0.0, None,
-                          client_ip=_client_ip(request), use_case="responses", seq=seq, latency_ms=latency_ms,
-                          error_kind=err_kind)
-            yield f"data: {json.dumps({'type': 'error', 'error': {'message': f'所有账号/候选模型均不可用（最后错误：{err_kind}）', 'code': 503}}, ensure_ascii=False)}\n\n"
+            ttfb_ms = int((ttfb_at - request_start) * 1000) if ttfb_at else None
+            seq = _log_chat_row(ttfb_ms, latency_ms, final_model, "resp", acc_i.uid or "-", 200,
+                                usage["total_tokens"] or usage["completion_tokens"],
+                                error_kind="success", prompt_text=_extract_input(payload),
+                                output_text=_extract_output(text))
+            updated = sess_i.updated_json()
+            sess_i.close()
+            _record_usage(key.id, acc_i.id, final_model, usage["credits"], updated,
+                          client_ip=_client_ip(request), use_case="responses",
+                          prompt_tokens=usage["prompt_tokens"],
+                          completion_tokens=usage["completion_tokens"],
+                          total_tokens=usage["total_tokens"],
+                          cached_tokens=usage["cached_tokens"],
+                          seq=seq, ttfb_ms=ttfb_ms, latency_ms=latency_ms,
+                          error_kind="success", http_status=200,
+                          req_preview=_store_preview(_extract_input(payload)),
+                          resp_preview=_store_preview(_extract_output(text)),
+                          full_payload=payload, full_response=text)
+        except Exception as e:
+            latency_ms = int((time.perf_counter() - request_start) * 1000)
+            ttfb_ms = int((ttfb_at - request_start) * 1000) if ttfb_at else None
+            err_text = str(e)
+            seq = _log_chat_row(ttfb_ms, latency_ms, final_model, "resp", acc_i.uid or "-", 200,
+                                None, error_kind="transport", prompt_text=_extract_input(payload))
+            _record_usage(key.id, acc_i.id, final_model, 0.0, None,
+                          client_ip=_client_ip(request), use_case="responses", seq=seq,
+                          latency_ms=latency_ms, error_kind="transport", http_status=200,
+                          req_preview=_store_preview(_extract_input(payload)),
+                          resp_preview=_store_preview(err_text),
+                          full_payload=payload, full_response=err_text)
         finally:
+            try:
+                await upstream_r.aclose()
+            except Exception:
+                pass
+            try:
+                await client.aclose()
+            except Exception:
+                pass
             db2.close()
 
     return StreamingResponse(_stream(), media_type="text/event-stream",
@@ -973,7 +1477,8 @@ async def models(
     acc = _select_account(db)
     if not acc:
         return JSONResponse(status_code=503,
-                            content={"error": {"message": "无可用账号", "type": "no_account"}})
+                            content={"error": {"message": f"无可用账号（{_no_account_reason(db)}）",
+                                               "type": "no_account"}})
     try:
         with backend.AccountSession(acc.auth_json) as sess:
             models_raw = sess.fetch_models()

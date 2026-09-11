@@ -81,7 +81,7 @@
 <!-- 主界面 -->
 <div id="app" class="hidden min-h-screen">
   <header class="bg-white shadow-sm sticky top-0 z-30">
-    <div class="max-w-6xl mx-auto px-4 h-14 flex items-center justify-between">
+    <div class="max-w-[1640px] mx-auto px-4 h-14 flex items-center justify-between">
       <div class="flex items-center gap-2 font-bold text-wb">
         <i class="fa-solid fa-share-nodes"></i> WorkBuddy 共享后台
       </div>
@@ -92,7 +92,7 @@
     </div>
   </header>
 
-  <main class="max-w-6xl mx-auto px-4 py-6">
+  <main class="max-w-[1640px] mx-auto px-4 py-6">
     <section id="overview" class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6"></section>
 
     <!-- Tabs -->
@@ -145,7 +145,7 @@
         <div class="grid gap-2 text-sm">
           <div class="flex items-center gap-2 flex-wrap">
             <span class="text-slate-400 w-16 shrink-0">Base URL</span>
-            <code id="shareBaseUrl" class="flex-1 min-w-0 truncate rounded bg-slate-50 px-2 py-1 font-mono text-xs"></code>
+            <code id="shareBaseUrl" onclick="copyText(this)" title="点击复制" class="flex-1 min-w-0 truncate rounded bg-slate-50 px-2 py-1 font-mono text-xs cursor-pointer hover:bg-slate-100"></code>
             <button onclick="copyText('#shareBaseUrl')" class="px-2 py-1 rounded border text-xs shrink-0" title="复制"><i class="fa-solid fa-copy"></i></button>
           </div>
           <div class="flex items-center gap-2 flex-wrap">
@@ -254,15 +254,31 @@
           <button onclick="loadLogs(1)" class="px-3 py-1.5 rounded-lg border text-sm"><i class="fa-solid fa-filter mr-1"></i> 筛选</button>
           <button onclick="exportLogs()" class="px-3 py-1.5 rounded-lg border text-sm" title="导出 CSV"><i class="fa-solid fa-file-csv mr-1"></i> 导出</button>
           <button onclick="loadLogs(_logPage)" class="px-3 py-1.5 rounded-lg border text-sm" title="刷新"><i class="fa-solid fa-rotate"></i></button>
+          <label class="flex items-center gap-1.5 text-sm text-slate-500 cursor-pointer select-none" title="只看失败/限流/报错的调用">
+            <input id="logOnlyErr" type="checkbox" onchange="loadLogs(1)" class="rounded border-slate-300" /> <span class="text-red-500">仅看异常</span>
+          </label>
+          <label class="flex items-center gap-1.5 text-sm text-slate-500 cursor-pointer select-none" title="关闭后隐藏提问/回复内容列">
+            <input id="logShowIO" type="checkbox" checked onchange="toggleLogIO()" class="rounded border-slate-300" /> 显示对话内容
+          </label>
         </div>
       </div>
       <div class="card overflow-hidden">
         <div class="overflow-x-auto max-h-[60vh]">
-          <table class="w-full text-sm min-w-sm">
+          <table class="w-full text-sm table-fixed">
             <thead class="bg-slate-50 text-slate-500 text-left sticky top-0"><tr>
-              <th class="px-3 py-2.5">时间</th><th class="px-3 py-2.5">Key</th><th class="px-3 py-2.5">账号</th>
-              <th class="px-3 py-2.5">模型</th><th class="px-3 py-2.5">输入/输出/缓存</th>
-              <th class="px-3 py-2.5">积分</th><th class="px-3 py-2.5">延迟</th><th class="px-3 py-2.5">用途</th><th class="px-3 py-2.5">结果</th>
+              <th class="px-3 py-2.5 whitespace-nowrap" style="width:132px">时间</th>
+              <th class="px-3 py-2.5 whitespace-nowrap" style="width:96px">Key</th>
+              <th class="px-3 py-2.5 whitespace-nowrap" style="width:100px">账号</th>
+              <th class="px-3 py-2.5 whitespace-nowrap" style="width:120px">模型</th>
+              <th class="px-3 py-2.5 whitespace-nowrap" style="width:132px">输入/输出/缓存</th>
+              <th class="px-3 py-2.5 whitespace-nowrap" style="width:64px">积分</th>
+              <th class="px-3 py-2.5 whitespace-nowrap" style="width:120px">延迟</th>
+              <th class="px-3 py-2.5 text-center whitespace-nowrap" style="width:60px">HTTP</th>
+              <th class="px-3 py-2.5 whitespace-nowrap" style="width:92px">用途</th>
+              <th class="px-3 py-2.5 col-io" style="width:230px">提问内容</th>
+              <th class="px-3 py-2.5 col-io" style="width:230px">回复内容</th>
+              <th class="px-3 py-2.5 text-center whitespace-nowrap" style="width:52px">结果</th>
+              <th class="px-3 py-2.5 text-right whitespace-nowrap" style="width:60px">上下文</th>
             </tr></thead>
             <tbody id="logBody"></tbody>
           </table>
@@ -359,7 +375,7 @@ function toast(msg, type = "ok") {
 }
 function openModal(html) { $("#modalBox").innerHTML = html; $("#modal").classList.remove("hidden"); $("#modal").classList.add("flex"); }
 function closeModal() { $("#modal").classList.add("hidden"); $("#modal").classList.remove("flex"); }
-function copyText(sel){ const i = $(sel); if(!i) return; i.select(); navigator.clipboard?.writeText(i.value) || document.execCommand("copy"); toast("已复制"); }
+function copyText(arg){ const i = (typeof arg === 'string') ? $(arg) : arg; if(!i) return; const text = (i.value !== undefined && i.value !== '') ? i.value : (i.textContent || i.innerText || '').trim(); copyToClipboard(text); }
 
 document.addEventListener("DOMContentLoaded", () => {
   $("#modal")?.addEventListener("click", (e) => { if (e.target === $("#modal")) closeModal(); });
@@ -379,16 +395,30 @@ function enterApp() {
   $("#login").classList.add("hidden"); $("#app").classList.remove("hidden");
   $("#proxyUrl").textContent = location.origin + "/v1";
   loadAccounts(); loadKeys(); loadModels(); loadSchedules(); loadLogs(); loadSyncConfig(); loadShareInfo();
+  // 恢复刷新前停留的标签（默认账号）
+  let tab = "accounts";
+  try { tab = localStorage.getItem(TAB_KEY) || "accounts"; } catch(e) {}
+  activateTab(tab);
 }
 
-// Tabs
-document.querySelectorAll(".tab-btn").forEach(b => b.onclick = () => {
-  document.querySelectorAll(".tab-btn").forEach(x => x.classList.remove("active", "text-wb"));
-  b.classList.add("active");
-  ["accounts","keys","models","schedules","logs","sync","settings"].forEach(t => {
-    $(`#panel-${t}`).classList.toggle("hidden", b.dataset.tab !== t);
+// Tabs：切换并记住当前标签（刷新 / 重新登录后回到原标签）
+const TAB_KEY = "wb_active_tab";
+const TABS = ["accounts","keys","models","schedules","logs","sync","settings"];
+function activateTab(tab){
+  if(!TABS.includes(tab)) tab = "accounts";
+  document.querySelectorAll(".tab-btn").forEach(x => {
+    const on = x.dataset.tab === tab;
+    x.classList.toggle("active", on);
+    x.classList.toggle("text-wb", on);
+    x.classList.toggle("text-slate-500", !on);
   });
-});
+  TABS.forEach(t => {
+    const p = $(`#panel-${t}`);
+    if(p) p.classList.toggle("hidden", t !== tab);
+  });
+  try { localStorage.setItem(TAB_KEY, tab); } catch(e) {}
+}
+document.querySelectorAll(".tab-btn").forEach(b => b.onclick = () => activateTab(b.dataset.tab));
 
 function esc(s){ return (s==null?"":String(s)).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 function card(t, v, ic, col) {
@@ -831,7 +861,7 @@ async function loadShareInfo() {
     if (box) {
       $("#shareModelCount").textContent = models.length;
       box.innerHTML = models.length
-        ? models.map(m => `<span class="px-2 py-0.5 rounded-full text-[11px] bg-emerald-50 text-emerald-700 border border-emerald-100 font-mono">${esc(m)}</span>`).join("")
+        ? models.map(m => `<span onclick="copyText(this)" title="点击复制模型名" class="cursor-pointer px-2 py-0.5 rounded-full text-[11px] bg-emerald-50 text-emerald-700 border border-emerald-100 font-mono hover:bg-emerald-100">${esc(m)}</span>`).join("")
         : '<span class="text-xs text-slate-400">未配置模型白名单（放行全部模型）</span>';
     }
   } catch (e) {}
@@ -1205,6 +1235,201 @@ async function submitSchedule(id){
 
 /* ==================== 用量日志（服务端分页） ==================== */
 let _logPage = 1, _logPageSize = 20;
+// 日志列表的「提问/回复」单元格：默认单行截断，悬浮看全文，点击可展开/收起
+function httpBadge(code){
+  if(code==null || code==="") return `<span class="text-slate-300 text-xs">—</span>`;
+  const c = Number(code);
+  let cls = "bg-slate-100 text-slate-500";
+  if(c>=200 && c<300) cls = "bg-emerald-100 text-emerald-700";
+  else if(c>=500) cls = "bg-red-100 text-red-700";
+  else if(c>=400) cls = "bg-orange-100 text-orange-700";
+  else if(c>=300) cls = "bg-amber-100 text-amber-700";
+  return `<span class="inline-block text-[10px] font-semibold px-1.5 py-0.5 rounded ${cls}">${c}</span>`;
+}
+function ioCell(text, logId, side){
+  if(!text) return `<span class="text-slate-300 text-xs">—</span>`;
+  const short = text.length > 60 ? text.slice(0,60)+'…' : text;
+  return `<div class="io-cell text-xs text-slate-600 truncate cursor-pointer hover:text-indigo-600" data-full="${esc(text)}" data-id="${logId||''}" data-side="${side||''}" title="点击查看全文">${esc(short)}</div>`;
+}
+// 事件委托：点击内容单元格 → 弹对话框显示全文（单元格内塞不下长内容）
+document.addEventListener('click', function(e){
+  const el = e.target.closest && e.target.closest('.io-cell');
+  if(!el) return;
+  e.stopPropagation();
+  openPreviewModal(el.dataset.full || '', el.dataset.id || '', el.dataset.side || '');
+});
+// 预览弹窗：优先展示完整上下文里的对应全文（列表预览只有 1000 字符），拉不到就用列表版
+async function openPreviewModal(text, logId, side){
+  _curDetailText = text || '';
+  const bodyHtml = t => `<div class="max-h-[70vh] overflow-y-auto rounded bg-slate-50 p-3"><pre class="whitespace-pre-wrap break-words text-xs text-slate-700 leading-relaxed">${esc(t||'（空）')}</pre></div>`;
+  openModal(`
+    <div class="flex items-center justify-between mb-3">
+      <h3 class="font-semibold text-slate-800"><i class="fa-regular fa-comment-dots mr-2 text-indigo-500"></i>${side==='resp'?'回复内容':'提问内容'} <span class="text-slate-400 text-xs font-normal" id="pv-status">${logId?'加载完整版…':'列表预览'}</span></h3>
+      <div class="flex items-center gap-4">
+        ${logId?`<button onclick="openLogDetail(${logId})" class="text-xs text-indigo-600 hover:text-indigo-800 font-medium"><i class="fa-solid fa-up-right-and-down-left-from-center mr-1"></i>完整上下文（含工具调用）</button>`:''}
+        <button onclick="copyLogDetail()" class="text-xs text-slate-400 hover:text-slate-600"><i class="fa-regular fa-copy mr-1"></i>复制</button>
+        <button onclick="closeModal()" class="text-slate-400 hover:text-slate-600 text-xl leading-none">&times;</button>
+      </div>
+    </div>
+    <div id="pv-body">${bodyHtml(text)}</div>`);
+  if(!logId) return;
+  try{
+    const r = await api(`/api/logs/${logId}/detail`);
+    if(!r.ok) return;
+    const d = await r.json();
+    let full = '';
+    if(side === 'resp'){
+      full = (d.output || '') + (d.reasoning ? ('\n\n[思考]\n' + d.reasoning) : '');
+      if((d.tool_calls||[]).length) full += '\n\n[工具调用]\n' + d.tool_calls.map(c=>`${c.name}(${c.arguments||''})`).join('\n');
+    }else{
+      const msgs = (d.messages||[]).filter(m => m.role !== 'system');
+      full = msgs.length ? msgs.map(m => (m.tool_calls ? `[工具调用] ${m.tool_calls}\n` : '') + (m.content||'')).join('\n\n---\n\n') : '';
+    }
+    if(full && full.length > (text||'').length){
+      _curDetailText = full;
+      const box = document.getElementById('pv-body');
+      if(box) box.innerHTML = bodyHtml(full);
+      const st = document.getElementById('pv-status');
+      if(st) st.textContent = `完整版 ${(full.length/1024).toFixed(1)} KB`;
+    }else{
+      const st = document.getElementById('pv-status');
+      if(st) st.textContent = '列表预览';
+    }
+  }catch(err){ /* 拉不到就用列表版，不打断 */ }
+}
+function toggleLogIO(){
+  const box = document.getElementById('logShowIO');
+  const show = !box || box.checked;
+  document.querySelectorAll('.col-io').forEach(el => { el.style.display = show ? '' : 'none'; });
+}
+
+// ---- 日志完整上下文弹窗 ----
+const _ROLE_META = {
+  system:    {label:'系统提示', cls:'bg-purple-100 text-purple-700'},
+  user:      {label:'用户',     cls:'bg-blue-100 text-blue-700'},
+  assistant: {label:'助手',     cls:'bg-emerald-100 text-emerald-700'},
+  tool:      {label:'工具结果', cls:'bg-amber-100 text-amber-700'},
+};
+function _longBody(text, cls){
+  // 内容过长时用 details 折叠，保留换行
+  const pre = `<pre class="whitespace-pre-wrap break-words ${cls} leading-relaxed">${esc(text)}</pre>`;
+  return text.length > 1500
+    ? `<details class="mt-1"><summary class="cursor-pointer text-[11px] text-indigo-600 select-none">内容较长（${text.length} 字符），点击展开/收起</summary><div class="mt-1 max-h-96 overflow-y-auto rounded bg-slate-50 p-2">${pre}</div></details>`
+    : pre;
+}
+function renderLogDetail(d){
+  const kb = ((d.size_bytes||0)/1024).toFixed(1);
+  const msgs = d.messages || [];
+  const usage = d.usage || {};
+  const msgHtml = msgs.map((m,i) => {
+    const meta = _ROLE_META[m.role] || {label:(m.role||'?'), cls:'bg-slate-100 text-slate-600'};
+    const content = m.content || '';
+    let body = '';
+    if(m.tool_calls){
+      body += `<div class="mb-2 rounded-lg bg-amber-50 border border-amber-200 p-2"><div class="text-[11px] font-semibold text-amber-700 mb-1"><i class="fa-solid fa-wrench mr-1"></i>工具调用</div>${_longBody(m.tool_calls,'text-[11px] text-amber-900')}</div>`;
+    }
+    if(content) body += _longBody(content, 'text-xs text-slate-700');
+    if(!body) body = `<span class="text-slate-300 text-xs">（空）</span>`;
+    return `<div class="border-l-2 border-slate-200 pl-3 py-2 hover:border-indigo-300">
+      <div class="flex items-center gap-2 mb-1 flex-wrap">
+        <span class="text-[10px] px-1.5 py-0.5 rounded ${meta.cls} font-medium">${meta.label}</span>
+        <span class="text-[10px] text-slate-400">#${i+1}</span>
+        ${m.name?`<span class="text-[10px] text-slate-400 font-mono">${esc(m.name)}</span>`:''}
+        <span class="text-[10px] text-slate-300 ml-auto">${content.length} 字符</span>
+      </div>${body}</div>`;
+  }).join('') || '<div class="text-slate-400 text-sm">（无上下文记录）</div>';
+
+  const callsHtml = (d.tool_calls||[]).map(c =>
+    `<div class="rounded-lg bg-amber-50 border border-amber-200 p-2 mb-2"><div class="text-[11px] font-semibold text-amber-700 mb-1"><i class="fa-solid fa-wrench mr-1"></i>${esc(c.name||'?')}</div>${_longBody(c.arguments||'','text-[11px] text-amber-900')}</div>`
+  ).join('') || '';
+  const usageHtml = Object.keys(usage).length
+    ? `<div class="flex flex-wrap gap-x-5 gap-y-1 text-xs bg-slate-50 rounded-lg p-2">${Object.entries(usage).map(([k,v])=>`<div><span class="text-slate-400 mr-1">${esc(k)}</span><span class="font-medium text-slate-700">${esc(String(v))}</span></div>`).join('')}</div>` : '';
+  const outHtml = d.output
+    ? `<div class="rounded-lg bg-emerald-50 border border-emerald-200 p-3">${_longBody(d.output,'text-xs text-slate-700')}</div>`
+    : (callsHtml ? '' : '<div class="text-slate-300 text-xs">（无输出）</div>');
+  const reasonHtml = d.reasoning
+    ? `<details class="mt-2"><summary class="cursor-pointer text-[11px] text-slate-500 select-none"><i class="fa-solid fa-brain mr-1"></i>思考过程（${d.reasoning.length} 字符）</summary><div class="mt-1 rounded bg-slate-50 p-2 max-h-72 overflow-y-auto">${_longBody(d.reasoning,'text-xs text-slate-500')}</div></details>` : '';
+
+  const ctxPanel = `
+    <div class="mb-2 flex items-center gap-3 flex-wrap text-xs text-slate-400">
+      ${usageHtml}
+      <span class="ml-auto"><i class="fa-solid fa-database mr-1"></i>存储 ${kb} KB</span>
+      <button onclick="copyLogDetail()" class="text-indigo-500 hover:text-indigo-700" title="复制完整上下文"><i class="fa-regular fa-copy mr-1"></i>复制</button>
+    </div>
+    ${outHtml}${reasonHtml}${callsHtml}
+    <div class="mt-3">${msgHtml}</div>`;
+
+  const rawPanel = `
+    <div class="space-y-3">
+      <div><div class="text-[11px] font-semibold text-slate-500 mb-1">原始请求报文（JSON）</div>
+        <pre class="whitespace-pre-wrap break-words text-[11px] text-slate-600 bg-slate-50 rounded p-2 max-h-80 overflow-y-auto">${esc(d.raw_request||'（无）')}</pre></div>
+      <div><div class="text-[11px] font-semibold text-slate-500 mb-1">原始响应报文（SSE）</div>
+        <pre class="whitespace-pre-wrap break-words text-[11px] text-slate-600 bg-slate-50 rounded p-2 max-h-80 overflow-y-auto">${esc(d.raw_response||'（无）')}</pre></div>
+    </div>`;
+
+  return `
+  <div class="flex items-center justify-between mb-3">
+    <h3 class="font-semibold text-slate-800"><i class="fa-solid fa-up-right-and-down-left-from-center mr-2 text-indigo-500"></i>调用上下文 <span class="text-slate-400 text-sm font-normal">log #${d.log_id}</span></h3>
+    <button onclick="closeModal()" class="text-slate-400 hover:text-slate-600 text-xl leading-none">&times;</button>
+  </div>
+  <div class="flex gap-1 border-b border-slate-200 mb-3">
+    <button id="dtab-ctx" onclick="switchDTab('ctx')" class="px-3 py-1.5 text-sm rounded-t-lg border-b-2 border-indigo-500 text-indigo-600 font-medium">结构化上下文</button>
+    <button id="dtab-raw" onclick="switchDTab('raw')" class="px-3 py-1.5 text-sm rounded-t-lg border-b-2 border-transparent text-slate-400 hover:text-slate-600">原始报文</button>
+  </div>
+  <div id="dpanel-ctx" class="max-h-[60vh] overflow-y-auto pr-1">${ctxPanel}</div>
+  <div id="dpanel-raw" class="hidden max-h-[60vh] overflow-y-auto pr-1">${rawPanel}</div>`;
+}
+let _curDetailText = '';
+function switchDTab(tab){
+  const ctx = document.getElementById('dpanel-ctx'), raw = document.getElementById('dpanel-raw');
+  const bt = document.getElementById('dtab-ctx'), br = document.getElementById('dtab-raw');
+  const on = 'px-3 py-1.5 text-sm rounded-t-lg border-b-2 border-indigo-500 text-indigo-600 font-medium';
+  const off = 'px-3 py-1.5 text-sm rounded-t-lg border-b-2 border-transparent text-slate-400 hover:text-slate-600';
+  if(!ctx||!raw) return;
+  ctx.classList.toggle('hidden', tab!=='ctx');
+  raw.classList.toggle('hidden', tab!=='raw');
+  bt.className = tab==='ctx' ? on : off;
+  br.className = tab==='raw' ? on : off;
+}
+// 复制到剪贴板：优先 async clipboard API（仅安全源可用），
+// 非 https/localhost 环境 navigator.clipboard 为 undefined，降级 execCommand
+async function copyToClipboard(text){
+  if(!text) { toast('没有可复制的内容'); return false; }
+  try {
+    if(navigator.clipboard && window.isSecureContext){
+      await navigator.clipboard.writeText(text);
+      toast('已复制到剪贴板');
+      return true;
+    }
+  } catch(e) { /* 降级 */ }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0';
+    ta.setAttribute('readonly', '');
+    document.body.appendChild(ta);
+    ta.focus(); ta.select();
+    ta.setSelectionRange(0, text.length);
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    toast(ok ? '已复制到剪贴板' : '复制失败，请手动选择文本复制');
+    return ok;
+  } catch(e) {
+    toast('复制失败：' + e.message);
+    return false;
+  }
+}
+function copyLogDetail(){
+  copyToClipboard(_curDetailText);
+}
+async function openLogDetail(id){
+  openModal(`<div class="text-center py-10 text-slate-400"><i class="fa-solid fa-spinner fa-spin mr-2"></i>加载完整上下文…</div>`);
+  const r = await api(`/api/logs/${id}/detail?raw=1`);
+  if(!r.ok){ openModal(`<div class="text-center py-10"><div class="text-slate-500 mb-3">${r.status===404?'该调用没有记录完整上下文（旧日志或功能未开启）':'加载失败'}</div><button onclick="closeModal()" class="px-4 py-1.5 rounded-lg border text-sm">关闭</button></div>`); return; }
+  const d = await r.json();
+  _curDetailText = JSON.stringify({messages:d.messages, output:d.output, tool_calls:d.tool_calls, usage:d.usage}, null, 2);
+  openModal(renderLogDetail(d));
+}
 async function loadLogs(page){
   _logPage = page || 1;
   const model = ($("#logModel") ? $("#logModel").value : "").trim();
@@ -1213,11 +1438,13 @@ async function loadLogs(page){
   const ip = ($("#logIp") ? $("#logIp").value : "").trim();
   const start = ($("#logStart") ? $("#logStart").value : "").trim();
   const end = ($("#logEnd") ? $("#logEnd").value : "").trim();
+  const onlyErr = ($("#logOnlyErr") && $("#logOnlyErr").checked) ? 1 : 0;
   const q = `page=${_logPage}&page_size=${_logPageSize}`
     + (model ? `&model=${encodeURIComponent(model)}` : "")
     + (key ? `&key=${encodeURIComponent(key)}` : "")
     + (account ? `&account=${encodeURIComponent(account)}` : "")
     + (ip ? `&client_ip=${encodeURIComponent(ip)}` : "")
+    + (onlyErr ? `&only_error=true` : "")
     + (start ? `&start=${encodeURIComponent(start + " 00:00:00")}` : "")
     + (end ? `&end=${encodeURIComponent(end + " 23:59:59")}` : "");
   const r = await api("/api/logs?"+q); if(!r.ok) return; const d = await r.json();
@@ -1239,22 +1466,34 @@ async function loadLogs(page){
       ? `<div class="leading-tight text-[11px]"><div class="flex items-center gap-1"><span class="w-7 text-slate-400">首字</span><span class="font-medium ${ttfbColor(l.ttfb_ms)}">${ttfbS}</span></div><div class="flex items-center gap-1 mt-0.5"><span class="w-7 text-slate-400">总</span><div class="flex items-center gap-1.5 flex-1"><div class="h-1.5 rounded-full bg-slate-200 overflow-hidden w-12"><div class="h-full rounded-full ${totalColor(l.latency_ms).replace('text-','bg-')}" style="width:${latencyBar(l.latency_ms)}%"></div></div><span class="font-medium ${totalColor(l.latency_ms)}">${latS}</span></div></div></div>`
       : `<span class="text-slate-400 text-xs">—</span>`;
     const ok = !l.error_kind || l.error_kind === 'success';
+    // 失败时把上游错误原文（已存进 response_preview）挂到 title，鼠标悬停即可看到限流提示
+    const errTip = ok ? '成功' : (l.error_kind||'失败') + (l.response_preview ? '\n\n' + l.response_preview : '');
     const statusHtml = ok
       ? `<span class="inline-flex items-center justify-center w-6 h-6 rounded-full bg-emerald-100 text-emerald-600 text-xs" title="成功"><i class="fa-solid fa-check"></i></span>`
-      : `<span class="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-700" title="${esc(l.error_kind||'')}">${esc((l.error_kind||'失败').slice(0,4))}</span>`;
-    return `<tr class="border-t hover:bg-slate-50" title="IP: ${esc(l.client_ip||'—')} | Seq: ${l.seq||'—'}">
+      : `<span class="inline-flex items-center justify-center w-6 h-6 rounded-full bg-red-100 text-red-600 text-xs cursor-help" title="${esc(errTip)}"><i class="fa-solid fa-triangle-exclamation"></i></span>`;
+    const rowCls = ok ? "border-t hover:bg-slate-50" : "border-t bg-red-50/60 hover:bg-red-50";
+    return `<tr class="${rowCls}" title="IP: ${esc(l.client_ip||'—')} | Seq: ${l.seq||'—'} | HTTP: ${esc(String(l.http_status||'—'))} | 状态: ${esc(l.error_kind||'success')}">
       <td class="px-3 py-2 text-xs text-slate-400 whitespace-nowrap">${fmtTime(l.created_at)}</td>
-      <td class="px-3 py-2 text-xs font-mono text-slate-600" title="${esc(l.key_name)}">${esc((l.key_name||'').slice(0,10))}</td>
-      <td class="px-3 py-2 text-xs text-slate-600" title="${esc(l.account_name)}">${esc((l.account_name||'').slice(0,12))}</td>
-      <td class="px-3 py-2 font-mono text-[11px] text-slate-600" title="${esc(l.model)}">${esc((l.model||'').slice(0,16))}</td>
+      <td class="px-3 py-2 text-xs font-mono text-slate-600 truncate" title="${esc(l.key_name)}">${esc((l.key_name||'').slice(0,10))}</td>
+      <td class="px-3 py-2 text-xs text-slate-600 truncate" title="${esc(l.account_name)}">${esc((l.account_name||'').slice(0,12))}</td>
+      <td class="px-3 py-2 font-mono text-[11px] text-slate-600 truncate" title="${esc(l.model)}">${esc((l.model||'').slice(0,16))}</td>
       <td class="px-3 py-2">${tokenHtml}</td>
       <td class="px-3 py-2 text-xs">${credHtml}</td>
       <td class="px-3 py-2">${latencyHtml}</td>
-      <td class="px-3 py-2 text-xs text-slate-500" title="透传给上游的 X-Agent-Purpose">${esc((l.use_case||'—').slice(0,14))}</td>
-      <td class="px-3 py-2">${statusHtml}</td>
+      <td class="px-3 py-2 text-center">${httpBadge(l.http_status)}</td>
+      <td class="px-3 py-2 text-xs text-slate-500 truncate" title="透传给上游的 X-Agent-Purpose">${esc((l.use_case||'—').slice(0,14))}</td>
+      <td class="px-3 py-2 col-io">${ioCell(l.request_preview, l.id, 'req')}</td>
+      <td class="px-3 py-2 col-io">${ioCell(l.response_preview, l.id, 'resp')}</td>
+      <td class="px-3 py-2 text-center">${statusHtml}</td>
+      <td class="px-3 py-2 text-right">
+        <button onclick="openLogDetail(${l.id})" class="text-slate-400 hover:text-indigo-600 transition" title="查看完整上下文（系统提示 / 多轮历史 / 工具调用）">
+          <i class="fa-solid fa-up-right-and-down-left-from-center"></i>
+        </button>
+      </td>
     </tr>`;
-  }).join("") || `<tr><td colspan="9" class="px-4 py-8 text-center text-slate-400">暂无日志（代理产生调用后这里会记录）</td></tr>`;
+  }).join("") || `<tr><td colspan="13" class="px-4 py-8 text-center text-slate-400">暂无日志（代理产生调用后这里会记录）</td></tr>`;
   $("#logPager").innerHTML = pagerHtml(total, _logPage, totalPages, "loadLogs");
+  toggleLogIO();
 }
 function fillLogDatalists(){
   const set = (id, arr) => {

@@ -2,6 +2,7 @@
 from datetime import datetime
 
 from sqlalchemy import Column, DateTime, Float, Integer, String, Text
+from sqlalchemy.dialects.mysql import LONGTEXT
 
 from admin.db import Base
 
@@ -81,6 +82,34 @@ class UsageLog(Base):
     ttfb_ms = Column(Integer, nullable=True, default=None)
     latency_ms = Column(Integer, nullable=True, default=None)
     error_kind = Column(String(32), default="")  # hard_credit | soft_rate | server | not_found | session_dead | transport | client | success
+    # 网关返回给客户端的真实 HTTP 状态码（成功 200 / 限流类 503 / 校验类 400·401·402 等）；
+    # 注意流式成功路径一旦发出 HTTP 头即锁定为 200，此处记录的是客户端实际看到的响应码。
+    http_status = Column(Integer, nullable=True, default=None)
+    # 对话内容预览（脱敏后截断入库，供管理后台日志列表展示）
+    request_preview = Column(Text, nullable=True, default=None)
+    response_preview = Column(Text, nullable=True, default=None)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class UsageLogDetail(Base):
+    """单次调用的完整上下文（系统提示 / 多轮历史 / 工具调用 / 模型输出 / 原始报文）。
+
+    与 usage_logs 一对一，单独建表避免主表被大字段拖垮；仅在 ADMIN_LOG_FULL 开启时写入。
+    payload_json 结构见 admin/routers/proxy.py:_build_detail：
+      {messages, output, tool_calls, reasoning, usage, raw_request, raw_response}
+    """
+
+    __tablename__ = "usage_log_details"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    log_id = Column(Integer, nullable=False, default=0, index=True)
+    # 结构化上下文（JSON 字符串）
+    payload_json = Column(LONGTEXT, nullable=True)
+    # 原始请求报文（JSON 字符串，未加工）
+    raw_request = Column(LONGTEXT, nullable=True)
+    # 原始响应报文（SSE 原文或 JSON 原文，未加工）
+    raw_response = Column(LONGTEXT, nullable=True)
+    size_bytes = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
