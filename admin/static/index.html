@@ -395,6 +395,7 @@ function enterApp() {
   $("#login").classList.add("hidden"); $("#app").classList.remove("hidden");
   $("#proxyUrl").textContent = location.origin + "/v1";
   loadAccounts(); loadKeys(); loadModels(); loadSchedules(); loadLogs(); loadSyncConfig(); loadShareInfo();
+  refreshBalances(true);  // 页面加载时自动从上游拉取最新积分（静默刷新，刷新后重算总剩余）
   // 恢复刷新前停留的标签（默认账号）
   let tab = "accounts";
   try { tab = localStorage.getItem(TAB_KEY) || "accounts"; } catch(e) {}
@@ -474,7 +475,13 @@ async function loadAccounts() {
     ${card("账号总数", s.total, "fa-users", "text-indigo-600")}
     ${card("可用账号", s.available, "fa-circle-check", "text-emerald-600")}
     ${card("总积分", s.balance_total, "fa-coins", "text-amber-600")}
-    ${card("总剩余", s.balance_remain, "fa-wallet", "text-rose-600")}`;
+    <div class="card p-4">
+      <div class="text-slate-400 text-xs flex items-center justify-between">
+        <span>总剩余</span>
+        <button onclick="refreshBalances()" class="text-rose-600 hover:text-rose-800" title="刷新积分（从上游重新拉取各账号余额）"><i class="fa-solid fa-rotate"></i></button>
+      </div>
+      <div class="mt-1 flex items-center gap-2"><i class="fa-solid fa-wallet text-rose-600"></i><span class="text-2xl font-bold">${s.balance_remain}</span></div>
+    </div>`;
   _accData = d.items || [];
   renderAccPage(1);
 }
@@ -732,10 +739,19 @@ async function importAll(){
   else toast("导入失败","err");
   if(d.errors) console.warn(d.errors);
 }
+// 刷新全部账号余额（从上游重新拉取），重算总剩余。silent=true 时不弹提示（用于页面加载自动刷新）
+async function refreshBalances(silent){
+  const r=await api("/api/accounts"); if(!r.ok){ if(!silent) toast("刷新失败","err"); return null; }
+  const ids=(await r.json()).items.map(x=>x.id);
+  let okN=0;
+  for(const id of ids){ if((await api("/api/accounts/"+id+"/refresh",{method:"POST"})).ok) okN++; }
+  loadAccounts();
+  if(!silent) toast(`积分已刷新（${okN}/${ids.length}）`);
+  return okN;
+}
 async function refreshAll(){
-  const r=await api("/api/accounts"); if(!r.ok)return; const ids=(await r.json()).items.map(x=>x.id);
-  for(const id of ids){ await api("/api/accounts/"+id+"/refresh",{method:"POST"}); }
-  toast("全部刷新完成"); loadAccounts();
+  const n=await refreshBalances(false);
+  toast(n===null?"刷新失败":"全部刷新完成", n===null?"err":"ok");
 }
 
 /* 批量上传 */
@@ -824,7 +840,10 @@ function keyRow(k) {
   return `
     <tr class="border-t hover:bg-slate-50">
       <td class="px-4 py-3">${esc(k.name||"未命名")}</td>
-      <td class="px-4 py-3 font-mono text-xs text-slate-500">${esc(k.masked)}</td>
+      <td class="px-4 py-3 font-mono text-xs text-slate-500 flex items-center gap-1.5">
+        <span class="truncate max-w-[170px]" title="${esc(k.masked)}">${esc(k.masked)}</span>
+        <button onclick="copyKeyFull(${k.id})" class="text-emerald-600 hover:text-emerald-800 shrink-0" title="复制完整 Key"><i class="fa-solid fa-copy"></i></button>
+      </td>
       <td class="px-4 py-3">${k.unlimited?"∞":k.credit_limit}</td>
       <td class="px-4 py-3 ${k.credit_used>=k.credit_limit&&!k.unlimited?'text-red-500':''}">${k.credit_used}</td>
       <td class="px-4 py-3">${k.status==="active"?'<span class="px-2 py-0.5 rounded-full text-xs bg-emerald-100 text-emerald-700">正常</span>':'<span class="px-2 py-0.5 rounded-full text-xs bg-slate-100 text-slate-500">已吊销</span>'}</td>
@@ -835,6 +854,15 @@ function keyRow(k) {
         <button onclick="deleteKey(${k.id})" class="text-red-500 hover:text-red-700" title="删除"><i class="fa-solid fa-trash"></i></button>
       </td>
     </tr>`;
+}
+// 直接复制完整 Key：调 view 接口拿明文 Key 后写入剪贴板（不弹窗）
+async function copyKeyFull(id){
+  try{
+    const r = await api("/api/keys/"+id+"/view");
+    const { ok, data:d } = await safeJson(r);
+    if(!r.ok){ toast("获取 Key 失败","err"); return; }
+    copyToClipboard(d.key);
+  }catch(e){ toast("获取失败: "+e.message,"err"); }
 }
 async function loadKeys(){
   const r = await api("/api/keys"); if(!r.ok) return; const d = await r.json();
