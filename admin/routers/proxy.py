@@ -827,7 +827,15 @@ def _no_account_reason(db: Session) -> str:
         parts = []
         for a in cooling[:3]:
             left = int((a.cool_until - now).total_seconds())
-            parts.append(f"{a.name}:{a.cool_kind or 'cool'} 剩余{left}s")
+            # 限流/额度类冷却：直接展示触发冷却的上游原话（含「将在 X 重置」），
+            # 否则用户只看到 "soft_rate 剩余Ns"，不知道真实原因和恢复时间。
+            reason = ""
+            if a.cool_kind in ("soft_rate", "hard_credit") and a.last_err_msg:
+                reason = _readable_upstream(a.last_err_msg)[:150]
+            if reason:
+                parts.append(f"{a.name}：{reason}（冷却剩余{left}s）")
+            else:
+                parts.append(f"{a.name}:{a.cool_kind or 'cool'} 剩余{left}s")
         return "账号冷却中（" + "，".join(parts) + "），冷却结束后自动恢复"
     return "账号暂不可用（防撞号窗口内刚被占用）"
 
@@ -853,8 +861,6 @@ def _readable_upstream(text: str) -> str:
                     return ev.strip()
     except Exception:
         pass
-    return s[:300]
-
     return s[:300]
 
 
