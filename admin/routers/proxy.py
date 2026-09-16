@@ -1083,6 +1083,26 @@ def _parse_usage(sse_text: str) -> dict:
     }
 
 
+_FINISH_REASON_RE = re.compile(r'"finish_reason"\s*:\s*"?([^",}\s]*)"?')
+
+
+def _upstream_finished(text: str) -> bool:
+    """判断上游是否**已经把流发完**（收到 `data: [DONE]` 或非空 finish_reason）。
+
+    背景：客户端断开时 `yield` 会抛 CancelledError / GeneratorExit，但分片是
+    在 `yield` **之前**才 append 进 collected 的，所以「最后一个分片在不在
+    collected 里」不能证明它送达了客户端。反过来，只要上游把 `[DONE]` /
+    `finish_reason` 发出来了，就说明这次请求在业务上是**完整产出**的，
+    客户端只是在收尾那一瞬间断开（或撞上 Starlette 中间件 cancel scope 的
+    收尾取消），不能记成「中断 / 内容不完整」。
+    """
+    if not text:
+        return False
+    if "[DONE]" in text:
+        return True
+    return any(m for m in _FINISH_REASON_RE.findall(text) if m and m != "null")
+
+
 def _estimate_credits(sse_text: str, model: str) -> float:
     """兼容旧调用：仅返回 credits 估算（token 明细用 _parse_usage）。"""
     u = _parse_usage(sse_text)
@@ -1236,32 +1256,45 @@ async def chat_completions(
             # 会导致这类请求完全不落库（后台「看不到日志」）。这里一并兜住：
             # 先补记一笔，再原样抛出以保留取消语义，不吞掉中断。
             aborted = isinstance(e, (asyncio.CancelledError, GeneratorExit))
-            kind = "client" if aborted else "transport"
             latency_ms = int((time.perf_counter() - request_start) * 1000)
             ttfb_ms = int((ttfb_at - request_start) * 1000) if ttfb_at else None
             pt = ct = tt = cch = None
-            if aborted:
-                # 流式被中断时，客户端其实已经收到了一部分内容，必须把这部分正文也留下来，
-                # 不能只记一句「已中断」。同时避免存 anyio 原始取消文本（又长又像报错）。
-                partial = "".join(collected)
-                if partial:
-                    err_text = (partial +
-                                f"\n\n[client_aborted] 客户端中断了流式响应"
-                                f"（已输出 {len(collected)} 个分片，内容不完整）")
-                    try:  # 能解析到多少算多少，解析失败也不影响落库
-                        pu = _parse_usage(partial)
-                        pt, ct = pu["prompt_tokens"], pu["completion_tokens"]
-                        tt, cch = pu["total_tokens"], pu["cached_tokens"]
-                    except Exception:
-                        pass
-                else:
-                    err_text = "[client_aborted] 客户端中断了流式响应（上游尚未返回任何数据）"
+            credits_out = 0.0
+            partial = "".join(collected)
+            # 上游已经把整段流发完（出现 [DONE] / 非空 finish_reason），客户端只是收尾时断开
+            # （或撞上 Starlette 中间件 cancel scope 的收尾取消）→ 业务上是完整响应，
+            # 按 success 记；不能因为一次取消就打成「中断 / 内容不完整」。
+            finished = aborted and _upstream_finished(partial)
+            if finished:
+                kind = "success"
+            elif aborted:
+                kind = "client"
+            else:
+                kind = "transport"
+            if partial:
+                try:  # 能解析到多少算多少，解析失败也不影响落库
+                    pu = _parse_usage(partial)
+                    pt, ct = pu["prompt_tokens"], pu["completion_tokens"]
+                    tt, cch = pu["total_tokens"], pu["cached_tokens"]
+                    if finished:
+                        credits_out = pu["credits"] or 0.0
+                except Exception:
+                    pass
+            if finished:
+                # 内容完整，不加「不完整」标记；也不存 anyio 原始取消文本（又长又像报错）
+                err_text = partial
+            elif aborted:
+                err_text = ((partial +
+                             f"\n\n[client_aborted] 客户端中断了流式响应"
+                             f"（已输出 {len(collected)} 个分片，内容不完整）")
+                            if partial else
+                            "[client_aborted] 客户端中断了流式响应（上游尚未返回任何数据）")
             else:
                 err_text = str(e) or ""
             seq = _log_chat_row(ttfb_ms, latency_ms, final_model, "stream", acc_i.uid or "-",
                                 200, tt or ct, error_kind=kind,
                                 prompt_text=_extract_input(payload))
-            _record_usage(key.id, acc_i.id, final_model, 0.0, None,
+            _record_usage(key.id, acc_i.id, final_model, credits_out, None,
                           client_ip=_client_ip(request), use_case="chat-completion",
                           prompt_tokens=pt, completion_tokens=ct,
                           total_tokens=tt, cached_tokens=cch,
@@ -1517,29 +1550,41 @@ async def responses_proxy(
             # 同 chat 流式：客户端中途断开会抛 CancelledError / GeneratorExit（BaseException），
             # 必须兜住并补记，否则这类请求一条日志都不会留。
             aborted = isinstance(e, (asyncio.CancelledError, GeneratorExit))
-            kind = "client" if aborted else "transport"
             latency_ms = int((time.perf_counter() - request_start) * 1000)
             ttfb_ms = int((ttfb_at - request_start) * 1000) if ttfb_at else None
             pt = ct = tt = cch = None
-            if aborted:
-                partial = "\n".join(raw_lines)
-                if partial:
-                    err_text = (partial +
-                                f"\n\n[client_aborted] 客户端中断了流式响应"
-                                f"（已输出 {len(raw_lines)} 行，内容不完整）")
-                    try:
-                        pu = _parse_usage(partial)
-                        pt, ct = pu["prompt_tokens"], pu["completion_tokens"]
-                        tt, cch = pu["total_tokens"], pu["cached_tokens"]
-                    except Exception:
-                        pass
-                else:
-                    err_text = "[client_aborted] 客户端中断了流式响应（上游尚未返回任何数据）"
+            credits_out = 0.0
+            partial = "\n".join(raw_lines)
+            # 同 chat 分支：上游已发完（[DONE] / 非空 finish_reason）就按 success 记
+            finished = aborted and _upstream_finished(partial)
+            if finished:
+                kind = "success"
+            elif aborted:
+                kind = "client"
+            else:
+                kind = "transport"
+            if partial:
+                try:
+                    pu = _parse_usage(partial)
+                    pt, ct = pu["prompt_tokens"], pu["completion_tokens"]
+                    tt, cch = pu["total_tokens"], pu["cached_tokens"]
+                    if finished:
+                        credits_out = pu["credits"] or 0.0
+                except Exception:
+                    pass
+            if finished:
+                err_text = partial
+            elif aborted:
+                err_text = ((partial +
+                             f"\n\n[client_aborted] 客户端中断了流式响应"
+                             f"（已输出 {len(raw_lines)} 行，内容不完整）")
+                            if partial else
+                            "[client_aborted] 客户端中断了流式响应（上游尚未返回任何数据）")
             else:
                 err_text = str(e) or ""
             seq = _log_chat_row(ttfb_ms, latency_ms, final_model, "resp", acc_i.uid or "-", 200,
                                 tt or ct, error_kind=kind, prompt_text=_extract_input(payload))
-            _record_usage(key.id, acc_i.id, final_model, 0.0, None,
+            _record_usage(key.id, acc_i.id, final_model, credits_out, None,
                           client_ip=_client_ip(request), use_case="responses",
                           prompt_tokens=pt, completion_tokens=ct,
                           total_tokens=tt, cached_tokens=cch,
