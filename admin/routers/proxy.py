@@ -1239,20 +1239,34 @@ async def chat_completions(
             kind = "client" if aborted else "transport"
             latency_ms = int((time.perf_counter() - request_start) * 1000)
             ttfb_ms = int((ttfb_at - request_start) * 1000) if ttfb_at else None
+            pt = ct = tt = cch = None
             if aborted:
-                # 不要存 anyio 原始取消文本（"Cancelled via cancel scope xxx by <Task ...>"），
-                # 它又长又像报错，会占满「回复内容」列。改成简短可读的标记，
-                # 并区分「上游还没返回就被取消」和「流式中途被取消」。
-                err_text = "[client_aborted] 客户端中断了流式响应" + (
-                    "（上游尚未返回任何数据）" if ttfb_at is None
-                    else f"（已收到 {len(collected)} 个分片）")
+                # 流式被中断时，客户端其实已经收到了一部分内容，必须把这部分正文也留下来，
+                # 不能只记一句「已中断」。同时避免存 anyio 原始取消文本（又长又像报错）。
+                partial = "".join(collected)
+                if partial:
+                    err_text = (partial +
+                                f"\n\n[client_aborted] 客户端中断了流式响应"
+                                f"（已输出 {len(collected)} 个分片，内容不完整）")
+                    try:  # 能解析到多少算多少，解析失败也不影响落库
+                        pu = _parse_usage(partial)
+                        pt, ct = pu["prompt_tokens"], pu["completion_tokens"]
+                        tt, cch = pu["total_tokens"], pu["cached_tokens"]
+                    except Exception:
+                        pass
+                else:
+                    err_text = "[client_aborted] 客户端中断了流式响应（上游尚未返回任何数据）"
             else:
                 err_text = str(e) or ""
             seq = _log_chat_row(ttfb_ms, latency_ms, final_model, "stream", acc_i.uid or "-",
-                                200, None, error_kind=kind, prompt_text=_extract_input(payload))
+                                200, tt or ct, error_kind=kind,
+                                prompt_text=_extract_input(payload))
             _record_usage(key.id, acc_i.id, final_model, 0.0, None,
-                          client_ip=_client_ip(request), use_case="chat-completion", seq=seq,
-                          latency_ms=latency_ms, error_kind=kind, http_status=200,
+                          client_ip=_client_ip(request), use_case="chat-completion",
+                          prompt_tokens=pt, completion_tokens=ct,
+                          total_tokens=tt, cached_tokens=cch,
+                          seq=seq, ttfb_ms=ttfb_ms, latency_ms=latency_ms,
+                          error_kind=kind, http_status=200,
                           req_preview=_store_preview(_extract_input(payload)),
                           resp_preview=_store_preview(err_text),
                           full_payload=payload, full_response=err_text)
@@ -1506,17 +1520,31 @@ async def responses_proxy(
             kind = "client" if aborted else "transport"
             latency_ms = int((time.perf_counter() - request_start) * 1000)
             ttfb_ms = int((ttfb_at - request_start) * 1000) if ttfb_at else None
+            pt = ct = tt = cch = None
             if aborted:
-                err_text = "[client_aborted] 客户端中断了流式响应" + (
-                    "（上游尚未返回任何数据）" if ttfb_at is None
-                    else f"（已收到 {len(raw_lines)} 行）")
+                partial = "\n".join(raw_lines)
+                if partial:
+                    err_text = (partial +
+                                f"\n\n[client_aborted] 客户端中断了流式响应"
+                                f"（已输出 {len(raw_lines)} 行，内容不完整）")
+                    try:
+                        pu = _parse_usage(partial)
+                        pt, ct = pu["prompt_tokens"], pu["completion_tokens"]
+                        tt, cch = pu["total_tokens"], pu["cached_tokens"]
+                    except Exception:
+                        pass
+                else:
+                    err_text = "[client_aborted] 客户端中断了流式响应（上游尚未返回任何数据）"
             else:
                 err_text = str(e) or ""
             seq = _log_chat_row(ttfb_ms, latency_ms, final_model, "resp", acc_i.uid or "-", 200,
-                                None, error_kind=kind, prompt_text=_extract_input(payload))
+                                tt or ct, error_kind=kind, prompt_text=_extract_input(payload))
             _record_usage(key.id, acc_i.id, final_model, 0.0, None,
-                          client_ip=_client_ip(request), use_case="responses", seq=seq,
-                          latency_ms=latency_ms, error_kind=kind, http_status=200,
+                          client_ip=_client_ip(request), use_case="responses",
+                          prompt_tokens=pt, completion_tokens=ct,
+                          total_tokens=tt, cached_tokens=cch,
+                          seq=seq, ttfb_ms=ttfb_ms, latency_ms=latency_ms,
+                          error_kind=kind, http_status=200,
                           req_preview=_store_preview(_extract_input(payload)),
                           resp_preview=_store_preview(err_text),
                           full_payload=payload, full_response=err_text)
