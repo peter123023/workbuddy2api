@@ -1239,7 +1239,15 @@ async def chat_completions(
             kind = "client" if aborted else "transport"
             latency_ms = int((time.perf_counter() - request_start) * 1000)
             ttfb_ms = int((ttfb_at - request_start) * 1000) if ttfb_at else None
-            err_text = str(e) or ("client_aborted" if aborted else "")
+            if aborted:
+                # 不要存 anyio 原始取消文本（"Cancelled via cancel scope xxx by <Task ...>"），
+                # 它又长又像报错，会占满「回复内容」列。改成简短可读的标记，
+                # 并区分「上游还没返回就被取消」和「流式中途被取消」。
+                err_text = "[client_aborted] 客户端中断了流式响应" + (
+                    "（上游尚未返回任何数据）" if ttfb_at is None
+                    else f"（已收到 {len(collected)} 个分片）")
+            else:
+                err_text = str(e) or ""
             seq = _log_chat_row(ttfb_ms, latency_ms, final_model, "stream", acc_i.uid or "-",
                                 200, None, error_kind=kind, prompt_text=_extract_input(payload))
             _record_usage(key.id, acc_i.id, final_model, 0.0, None,
@@ -1498,7 +1506,12 @@ async def responses_proxy(
             kind = "client" if aborted else "transport"
             latency_ms = int((time.perf_counter() - request_start) * 1000)
             ttfb_ms = int((ttfb_at - request_start) * 1000) if ttfb_at else None
-            err_text = str(e) or ("client_aborted" if aborted else "")
+            if aborted:
+                err_text = "[client_aborted] 客户端中断了流式响应" + (
+                    "（上游尚未返回任何数据）" if ttfb_at is None
+                    else f"（已收到 {len(raw_lines)} 行）")
+            else:
+                err_text = str(e) or ""
             seq = _log_chat_row(ttfb_ms, latency_ms, final_model, "resp", acc_i.uid or "-", 200,
                                 None, error_kind=kind, prompt_text=_extract_input(payload))
             _record_usage(key.id, acc_i.id, final_model, 0.0, None,
