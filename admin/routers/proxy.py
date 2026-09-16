@@ -1104,22 +1104,36 @@ async def chat_completions(
     if not api_key and authorization and authorization.startswith("Bearer "):
         api_key = authorization[7:].strip()
     if not api_key:
+        _record_usage(0, 0, "unknown", 0.0, None, client_ip=_client_ip(request),
+                      use_case="chat-completion", error_kind="auth_error", http_status=401,
+                      resp_preview="缺少 API Key")
         return JSONResponse(status_code=401, content={"error": {"message": "缺少 API Key", "type": "auth_error"}})
 
     key = get_key_row(db, api_key)
     if not key:
+        _record_usage(0, 0, "unknown", 0.0, None, client_ip=_client_ip(request),
+                      use_case="chat-completion", error_kind="invalid_key", http_status=401,
+                      resp_preview="无效 API Key")
         return JSONResponse(status_code=401, content={"error": {"message": "无效 API Key", "type": "auth_error"}})
     try:
         check_quota(key)
     except Exception as e:
+        _record_usage(key.id, 0, "unknown", 0.0, None, client_ip=_client_ip(request),
+                      use_case="chat-completion", error_kind="quota",
+                      http_status=getattr(e, "status_code", 403),
+                      resp_preview=_store_preview(str(getattr(e, "detail", e))))
         return JSONResponse(status_code=e.status_code, content=e.detail)
 
     try:
         payload = await request.json()
     except Exception:
+        _record_usage(key.id, 0, "unknown", 0.0, None, client_ip=_client_ip(request),
+                      use_case="chat-completion", error_kind="bad_json", http_status=400,
+                      resp_preview="bad json")
         return JSONResponse(status_code=400, content={"error": {"message": "bad json", "type": "invalid_request"}})
 
     acc = _select_account(db)
+
     if not acc:
         # 无可用账号此前不写日志，后台完全看不到这类失败；这里补记录并写明真实原因
         reason = _no_account_reason(db)
@@ -1136,6 +1150,10 @@ async def chat_completions(
     # 模型白名单检查 + 免费优先选择
     resolved_model = _pick_best_model(db, model)
     if resolved_model is None:
+        _record_usage(key.id, 0, str(model), 0.0, None, client_ip=_client_ip(request),
+                      use_case="chat-completion", error_kind="model_not_found", http_status=400,
+                      req_preview=_store_preview(_extract_input(payload)),
+                      resp_preview=_store_preview(f"模型 '{model}' 不存在或已被禁用"))
         return JSONResponse(
             status_code=400,
             content={"error": {"message": f"模型 '{model}' 不存在或已被禁用", "type": "model_not_found"}},
@@ -1252,29 +1270,51 @@ async def responses_proxy(
     绝不把上游中断感传递给客户端。
     """
     if not _RESPONSES_AVAILABLE:
+        _record_usage(0, 0, "unknown", 0.0, None, client_ip=_client_ip(request),
+                      use_case="responses", error_kind="not_supported", http_status=501,
+                      resp_preview="Responses 适配器未加载")
         return JSONResponse(status_code=501, content={"error": {"message": "Responses 适配器未加载", "type": "not_supported"}})
 
     api_key = x_api_key
     if not api_key and authorization and authorization.startswith("Bearer "):
         api_key = authorization[7:].strip()
     if not api_key:
+        _record_usage(0, 0, "unknown", 0.0, None, client_ip=_client_ip(request),
+                      use_case="responses", error_kind="auth_error", http_status=401,
+                      resp_preview="缺少 API Key")
         return JSONResponse(status_code=401, content={"error": {"message": "缺少 API Key", "type": "auth_error"}})
+
     key = get_key_row(db, api_key)
     if not key:
+        _record_usage(0, 0, "unknown", 0.0, None, client_ip=_client_ip(request),
+                      use_case="responses", error_kind="invalid_key", http_status=401,
+                      resp_preview="无效 API Key")
         return JSONResponse(status_code=401, content={"error": {"message": "无效 API Key", "type": "auth_error"}})
     try:
         check_quota(key)
     except Exception as e:
+        _record_usage(key.id, 0, "unknown", 0.0, None, client_ip=_client_ip(request),
+                      use_case="responses", error_kind="quota",
+                      http_status=getattr(e, "status_code", 403),
+                      resp_preview=_store_preview(str(getattr(e, "detail", e))))
         return JSONResponse(status_code=e.status_code, content=e.detail)
 
     try:
         payload = await request.json()
     except Exception:
+        _record_usage(key.id, 0, "unknown", 0.0, None, client_ip=_client_ip(request),
+                      use_case="responses", error_kind="bad_json", http_status=400,
+                      resp_preview="bad json")
         return JSONResponse(status_code=400, content={"error": {"message": "bad json", "type": "invalid_request"}})
 
     try:
         chat_body = responses_request_to_chat(payload)
+
     except Exception as e:
+        _record_usage(key.id, 0, "unknown", 0.0, None, client_ip=_client_ip(request),
+                      use_case="responses", error_kind="invalid_request", http_status=400,
+                      req_preview=_store_preview(_extract_input(payload)),
+                      resp_preview=_store_preview(f"请求转换失败：{e}"))
         return JSONResponse(status_code=400,
                             content={"error": {"message": f"请求转换失败：{e}", "type": "invalid_request"}})
 
@@ -1288,6 +1328,10 @@ async def responses_proxy(
     requested = payload.get("model", "auto")
     resolved = _pick_best_model(db, requested)
     if resolved is None:
+        _record_usage(key.id, 0, str(requested), 0.0, None, client_ip=_client_ip(request),
+                      use_case="responses", error_kind="model_not_found", http_status=400,
+                      req_preview=_store_preview(_extract_input(payload)),
+                      resp_preview=_store_preview(f"模型 '{requested}' 不存在或已被禁用"))
         return JSONResponse(status_code=400,
                             content={"error": {"message": f"模型 '{requested}' 不存在或已被禁用", "type": "model_not_found"}})
 
@@ -1328,6 +1372,10 @@ async def responses_proxy(
                                     sess_i.close()
                                     continue
                                 sess_i.close()
+                                _record_usage(key.id, acc_i.id, m, 0.0, None, client_ip=_client_ip(request),
+                                                                  use_case="responses", error_kind=kind, http_status=r.status_code,
+                                                                  req_preview=_store_preview(_extract_input(payload)),
+                                                                  resp_preview=_store_preview(text))
                                 return JSONResponse(status_code=r.status_code,
                                                     content={"error": {"message": text, "code": r.status_code}})
                             converter = ResponsesStreamConverter(model=model_name)
