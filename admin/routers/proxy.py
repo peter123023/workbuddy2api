@@ -3,6 +3,7 @@
 流程：校验 Key → 配额拦截（超额提示『积分已耗尽』）→ 从可用账号中挑选 →
 用该账号凭据转发到后端 → 流式返回 → 按用量回扣 Key 额度。
 """
+import asyncio
 import json
 import logging
 import re
@@ -1229,18 +1230,26 @@ async def chat_completions(
                           req_preview=_store_preview(_extract_input(payload)),
                           resp_preview=_store_preview(_extract_output(text)),
                           full_payload=payload, full_response=text)
-        except Exception as e:
+        except (Exception, asyncio.CancelledError, GeneratorExit) as e:
+            # 客户端中途断开（IDE 取消 / 停止生成）时，`yield` 会抛 CancelledError
+            # 或 GeneratorExit —— 两者都是 BaseException，except Exception 捕获不到，
+            # 会导致这类请求完全不落库（后台「看不到日志」）。这里一并兜住：
+            # 先补记一笔，再原样抛出以保留取消语义，不吞掉中断。
+            aborted = isinstance(e, (asyncio.CancelledError, GeneratorExit))
+            kind = "client" if aborted else "transport"
             latency_ms = int((time.perf_counter() - request_start) * 1000)
             ttfb_ms = int((ttfb_at - request_start) * 1000) if ttfb_at else None
-            err_text = str(e)
+            err_text = str(e) or ("client_aborted" if aborted else "")
             seq = _log_chat_row(ttfb_ms, latency_ms, final_model, "stream", acc_i.uid or "-",
-                                200, None, error_kind="transport", prompt_text=_extract_input(payload))
+                                200, None, error_kind=kind, prompt_text=_extract_input(payload))
             _record_usage(key.id, acc_i.id, final_model, 0.0, None,
                           client_ip=_client_ip(request), use_case="chat-completion", seq=seq,
-                          latency_ms=latency_ms, error_kind="transport", http_status=200,
+                          latency_ms=latency_ms, error_kind=kind, http_status=200,
                           req_preview=_store_preview(_extract_input(payload)),
                           resp_preview=_store_preview(err_text),
                           full_payload=payload, full_response=err_text)
+            if aborted:
+                raise
         finally:
             try:
                 await upstream_r.aclose()
@@ -1482,18 +1491,24 @@ async def responses_proxy(
                           req_preview=_store_preview(_extract_input(payload)),
                           resp_preview=_store_preview(_extract_output(text)),
                           full_payload=payload, full_response=text)
-        except Exception as e:
+        except (Exception, asyncio.CancelledError, GeneratorExit) as e:
+            # 同 chat 流式：客户端中途断开会抛 CancelledError / GeneratorExit（BaseException），
+            # 必须兜住并补记，否则这类请求一条日志都不会留。
+            aborted = isinstance(e, (asyncio.CancelledError, GeneratorExit))
+            kind = "client" if aborted else "transport"
             latency_ms = int((time.perf_counter() - request_start) * 1000)
             ttfb_ms = int((ttfb_at - request_start) * 1000) if ttfb_at else None
-            err_text = str(e)
+            err_text = str(e) or ("client_aborted" if aborted else "")
             seq = _log_chat_row(ttfb_ms, latency_ms, final_model, "resp", acc_i.uid or "-", 200,
-                                None, error_kind="transport", prompt_text=_extract_input(payload))
+                                None, error_kind=kind, prompt_text=_extract_input(payload))
             _record_usage(key.id, acc_i.id, final_model, 0.0, None,
                           client_ip=_client_ip(request), use_case="responses", seq=seq,
-                          latency_ms=latency_ms, error_kind="transport", http_status=200,
+                          latency_ms=latency_ms, error_kind=kind, http_status=200,
                           req_preview=_store_preview(_extract_input(payload)),
                           resp_preview=_store_preview(err_text),
                           full_payload=payload, full_response=err_text)
+            if aborted:
+                raise
         finally:
             try:
                 await upstream_r.aclose()
