@@ -2,6 +2,7 @@
 import glob
 import json
 import os
+import re
 import shutil
 from datetime import datetime
 from typing import Optional
@@ -61,6 +62,38 @@ def _apply_meta(acc: Account, auth_json: str):
         acc.name = (nick if nick and nick.lower() != "null" else None) or meta.get("uid") or "未命名"
 
 
+def _balance_err_text(e: Exception) -> str:
+    """把刷新余额时的异常转成可读、含后端 HTTP 状态码的短消息，便于一眼看出是 401 还是别的。
+
+    入参是 converter.CredentialManager 抛出的 RuntimeError，其文案形如：
+      - "后端返回非 JSON POST /v2/billing/meter/get-user-resource HTTP 401: <html>..."
+      - "后端请求失败 POST /v2/billing/meter/get-user-resource: HTTP 401 / {...}"
+      - "后端请求网络失败 POST /v2/billing/meter/get-user-resource: ConnectError..."
+    """
+    msg = str(e)
+    m = re.search(r"HTTP\s+(\d{3})", msg)
+    if m:
+        code = m.group(1)
+        label = {
+            "400": "请求格式错误",
+            "401": "token被拒/会话失效",
+            "403": "无权限",
+            "404": "接口不存在",
+            "429": "触发限流",
+            "500": "后端5xx",
+            "502": "后端网关错误",
+            "503": "后端不可用",
+        }.get(code, f"后端HTTP {code}")
+        # 去掉 HTML 噪声（非 JSON 响应常带 <html>...）
+        clean = msg.split("<", 1)[0].strip()
+        # 对 "返回非 JSON ... HTTP 401: ..." 只保留到状态码，丢弃后续噪声
+        clean = re.sub(r"(HTTP\s+\d{3}).*", r"\1", clean)
+        return f"[{label}({code})] {clean[:160]}"
+    if "网络失败" in msg or "Timeout" in msg or "timeout" in msg:
+        return f"[后端网络不可达] {msg[:160]}"
+    return f"[刷新异常] {msg[:200]}"
+
+
 def _refresh_balance(acc: Account) -> bool:
     try:
         with backend.AccountSession(acc.auth_json) as sess:
@@ -69,8 +102,10 @@ def _refresh_balance(acc: Account) -> bool:
             acc.balance_remain = int(bal.get("remain", 0) or 0)
             acc.auth_json = sess.updated_json()  # 回写可能刷新的 token
         acc.last_sync_at = datetime.utcnow()
+        acc.last_err_msg = ""  # 成功则清空历史错误，避免残留旧报错误导
         return True
-    except Exception:
+    except Exception as e:
+        acc.last_err_msg = _balance_err_text(e)[:255]
         return False
 
 
@@ -89,6 +124,7 @@ def list_accounts(_: bool = Depends(require_admin), db: Session = Depends(get_db
             "balance_remain": a.balance_remain,
             "last_sync_at": a.last_sync_at.isoformat() if a.last_sync_at else None,
             "last_used_at": a.last_used_at.isoformat() if a.last_used_at else None,
+            "last_err_msg": a.last_err_msg or "",
             "created_at": a.created_at.isoformat() if a.created_at else None,
         }
         for a in rows
@@ -139,7 +175,7 @@ def batch_add(body: AccountBatchIn, _: bool = Depends(require_admin), db: Sessio
         if _refresh_balance(acc):
             added += 1
         else:
-            errors.append(f"账号 {acc.id} 余额刷新失败（凭据可能失效）")
+            errors.append(f"账号 {acc.id}({acc.name}) 余额刷新失败：{acc.last_err_msg or '凭据可能失效'}")
         db.commit()
     return {"added": added, "errors": errors}
 
@@ -236,7 +272,7 @@ def import_local(body: ImportLocalIn, _: bool = Depends(require_admin), db: Sess
         if _refresh_balance(acc):
             added += 1
         else:
-            errors.append(f"账号 {acc.id}({acc.name}) 余额刷新失败（凭据可能失效）")
+            errors.append(f"账号 {acc.id}({acc.name}) 余额刷新失败：{acc.last_err_msg or '凭据可能失效'}")
         db.commit()
     return {"added": added, "errors": errors}
 
@@ -271,7 +307,7 @@ def refresh_account(acc_id: int, _: bool = Depends(require_admin), db: Session =
     ok = _refresh_balance(acc)
     db.commit()
     if not ok:
-        raise HTTPException(status_code=502, detail="刷新失败：后端调用异常（凭据/限流）")
+        raise HTTPException(status_code=502, detail=f"刷新失败：{acc.last_err_msg or '后端调用异常（凭据/限流）'}")
     return {"id": acc.id, "balance_total": acc.balance_total, "balance_remain": acc.balance_remain}
 
 
