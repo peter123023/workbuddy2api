@@ -62,10 +62,11 @@ def _apply_meta(acc: Account, auth_json: str):
         acc.name = (nick if nick and nick.lower() != "null" else None) or meta.get("uid") or "未命名"
 
 
-def _balance_err_text(e: Exception) -> str:
-    """把刷新余额时的异常转成可读、含后端 HTTP 状态码的短消息，便于一眼看出是 401 还是别的。
+def _backend_err_text(e: Exception) -> str:
+    """把调用腾讯后端失败时的异常转成可读、含 HTTP 状态码的短消息，便于一眼看出是 401 还是别的。
 
-    入参是 converter.CredentialManager 抛出的 RuntimeError，其文案形如：
+    供「刷新余额 / 积分明细 / 请求用量」等所有走 converter.CredentialManager 的接口复用。
+    入参是 converter 抛出的 RuntimeError，其文案形如：
       - "后端返回非 JSON POST /v2/billing/meter/get-user-resource HTTP 401: <html>..."
       - "后端请求失败 POST /v2/billing/meter/get-user-resource: HTTP 401 / {...}"
       - "后端请求网络失败 POST /v2/billing/meter/get-user-resource: ConnectError..."
@@ -91,7 +92,7 @@ def _balance_err_text(e: Exception) -> str:
         return f"[{label}({code})] {clean[:160]}"
     if "网络失败" in msg or "Timeout" in msg or "timeout" in msg:
         return f"[后端网络不可达] {msg[:160]}"
-    return f"[刷新异常] {msg[:200]}"
+    return f"[后端异常] {msg[:200]}"
 
 
 def _refresh_balance(acc: Account) -> bool:
@@ -105,7 +106,7 @@ def _refresh_balance(acc: Account) -> bool:
         acc.last_err_msg = ""  # 成功则清空历史错误，避免残留旧报错误导
         return True
     except Exception as e:
-        acc.last_err_msg = _balance_err_text(e)[:255]
+        acc.last_err_msg = _backend_err_text(e)[:255]
         return False
 
 
@@ -325,7 +326,7 @@ def credit_details(acc_id: int, _: bool = Depends(require_admin), db: Session = 
             db.commit()
         return {"id": acc_id, "account": acc.name, "packages": packages}
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"获取积分明细失败: {e}")
+        raise HTTPException(status_code=502, detail=f"获取积分明细失败：{_backend_err_text(e)}")
 
 
 @router.get("/{acc_id}/request-usage")
@@ -354,7 +355,7 @@ def request_usage(
             db.commit()
         return data
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"获取请求用量失败: {e}")
+        raise HTTPException(status_code=502, detail=f"获取请求用量失败：{_backend_err_text(e)}")
 
 
 @router.patch("/{acc_id}")
