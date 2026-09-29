@@ -100,7 +100,8 @@ def _record_usage(key_id: int, account_id: int, model: str, credits: float | Non
                   latency_ms: int | None = None, error_kind: str = "",
                   http_status: int | None = None,
                   req_preview: str = "", resp_preview: str = "",
-                  full_payload=None, full_response: str = "") -> int | None:
+                  full_payload=None, full_response: str = "",
+                  full_egress: str = "", full_up_request=None) -> int | None:
     """流式响应结束后独立开一个 DB 会话写入用量/额度。
 
     关键点：请求作用域的 db 会话在端点返回 StreamingResponse 时已被依赖 teardown 关闭，
@@ -112,6 +113,12 @@ def _record_usage(key_id: int, account_id: int, model: str, credits: float | Non
     - 0.0 表示上游明确返回 0 或请求失败，不再估算。
 
     若本次使用了估算值，会启动后台线程在 60 秒后调用上游用量接口回写真实积分。
+
+    报文入参（务必按「跳」区分，避免入口请求配上游响应这种跨跳错配）：
+    - full_payload : 【网关入口】客户端原样请求体（dict）
+    - full_egress  : 【网关出口】网关最终回给客户端的报文（SSE/JSON 文本）
+    - full_response: 【上游响应】后端原生响应文本（同时用于结构化上下文抽取）
+    - full_up_request: 【上游请求】网关转换后实际发给后端的请求体
     """
     log_id = None
     try:
@@ -158,8 +165,9 @@ def _record_usage(key_id: int, account_id: int, model: str, credits: float | Non
             db.commit()
             log_id = log.id
             # 完整上下文（系统提示 / 多轮历史 / 工具调用 / 原始报文）单独落详情表
-            if full_payload is not None or full_response:
-                _save_detail(log_id, full_payload, full_response)
+            if full_payload is not None or full_response or full_egress:
+                # 四个报文按「跳」落库：入口/出口（网关边界）+ 上游请求/上游响应（上游边界）
+                _save_detail(log_id, full_payload, full_response, full_egress, full_up_request)
             if estimated and account_id and updated_auth_json:
                 threading.Thread(
                     target=_fetch_real_credits,
@@ -596,25 +604,61 @@ def _build_detail(payload, resp_text: str) -> dict:
     }
 
 
-def _save_detail(log_id: int | None, payload, resp_text: str) -> None:
-    """把完整上下文写入 usage_log_details（失败不影响主流程）。"""
+def _as_text(obj) -> str:
+    """把 dict/list 序列化成 JSON 文本，其余原样转字符串（None → 空串）。"""
+    if obj is None:
+        return ""
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, (dict, list)):
+        try:
+            return json.dumps(obj, ensure_ascii=False)
+        except Exception:
+            return str(obj)
+    return str(obj)
+
+
+def _err_egress(status: int, message: str, type_: str) -> str:
+    """构造「网关出口」错误报文文本：就是网关真正回给客户端的那份 JSON。"""
+    return _as_text({"error": {"message": message, "type": type_}, "http_status": status})
+
+
+def _save_detail(log_id: int | None, payload, resp_text: str,
+                 egress_text: str = "", up_request=None) -> None:
+    """把完整上下文写入 usage_log_details（失败不影响主流程）。
+
+    四个报文字段按「跳」分组，保证同组请求/响应自洽：
+
+      | 字段              | 方向           | 含义                                  |
+      |-------------------|----------------|---------------------------------------|
+      | raw_request       | 客户端 → 网关  | 入口请求（原样，未加工）              |
+      | raw_response      | 网关 → 客户端  | 出口响应（客户端实际收到的内容）      |
+      | upstream_request  | 网关 → 后端    | 转换后实际转发的请求                  |
+      | upstream_response | 后端 → 网关    | 后端原生响应（chat SSE / JSON）       |
+
+    resp_text 是「上游响应」，同时用于结构化上下文抽取（output/reasoning/tool_calls
+    都是从后端 chat 格式里解析的，不能用出口的 Responses 事件替代）。
+    """
     if not log_id or not getattr(settings, "LOG_FULL", True):
         return
     max_bytes = getattr(settings, "LOG_FULL_MAX", 2 * 1024 * 1024)
     try:
-        detail = _build_detail(payload, resp_text)
+        upstream_text = resp_text or ""
+        # 结构化抽取仍用上游文本（chat 格式）；上游缺失时退化为出口文本
+        detail = _build_detail(payload, upstream_text or egress_text)
         payload_json = json.dumps(detail, ensure_ascii=False)
-        try:
-            raw_req = json.dumps(payload, ensure_ascii=False) if isinstance(payload, dict) else str(payload)
-        except Exception:
-            raw_req = str(payload)
+        raw_req = _as_text(payload)
+        # 出口响应缺省时退化为上游文本，至少保证 raw_response 非空、可自洽阅读
+        egress = _as_text(egress_text) or upstream_text
         db = SessionLocal()
         try:
             db.add(UsageLogDetail(
                 log_id=log_id,
                 payload_json=_clamp(payload_json, max_bytes),
                 raw_request=_clamp(raw_req, max_bytes),
-                raw_response=_clamp(resp_text or "", max_bytes),
+                raw_response=_clamp(egress, max_bytes),
+                upstream_request=_clamp(_as_text(up_request), max_bytes),
+                upstream_response=_clamp(upstream_text, max_bytes),
                 size_bytes=len(payload_json.encode("utf-8", errors="ignore")),
             ))
             db.commit()
@@ -632,7 +676,9 @@ def _log_chat_row(ttfb_ms, latency_ms, model, mode, uid, status, toks, error_kin
     """
     seq = next(_CHAT_SEQ)
     now = datetime.now().strftime("%H:%M:%S")
-    model = (model or "-")[:11]
+    # 不再硬截断：模型名（如 glm-5.3-flash / deepseek-v4.1-flash）需完整打印，
+    # 仅保留兜底。列宽由下方 {model:24s} 控制，<=24 对齐、超长原样完整显示。
+    model = (model or "-")
     tok_field = "-" if toks is None else str(toks)
     tps = "-"
     if toks is not None and latency_ms and latency_ms > 0:
@@ -640,7 +686,7 @@ def _log_chat_row(ttfb_ms, latency_ms, model, mode, uid, status, toks, error_kin
     ttfb = "-" if ttfb_ms is None or ttfb_ms <= 0 else f"{ttfb_ms}ms"
     uid_prefix = (uid or "-")[:8]
     latency = f"{latency_ms}ms" if latency_ms is not None else "-"
-    row = (f"| #{seq:03d} | {now} | {model:11s} | {mode:6s} | {status:3d} | uid={uid_prefix} "
+    row = (f"| #{seq:03d} | {now} | {model:24s} | {mode:6s} | {status:3d} | uid={uid_prefix} "
            f"| TTFB={ttfb:>5} | tok={tok_field:>5} | {tps:>6}t/s | total={latency:>7} | {error_kind}")
     limit = getattr(settings, "LOG_PREVIEW", 48)
     if limit > 0:
@@ -942,7 +988,9 @@ async def _try_open_upstream(db, order, body, request, url, key, payload, use_ca
                       latency_ms=latency_ms, error_kind=err_kind,
                       req_preview=_store_preview(_extract_input(payload)),
                       resp_preview=_store_preview(last_err_msg),
-                      full_payload=payload, full_response=last_err_msg or "")
+                      full_payload=payload, full_response=last_err_msg or "",
+                      full_egress=_err_egress(last_status or 503, last_err_msg, err_kind),
+                      full_up_request=body)
         await client.aclose()
         return ("fail", err_kind, last_err_msg, last_status)
     except Exception:
@@ -1162,7 +1210,8 @@ async def chat_completions(
                       client_ip=_client_ip(request), use_case="chat-completion",
                       error_kind="no_account", http_status=503,
                       req_preview=_store_preview(_extract_input(payload)),
-                      resp_preview=_store_preview(reason), full_payload=payload, full_response=reason)
+                      resp_preview=_store_preview(reason), full_payload=payload,
+                      full_egress=_err_egress(503, f"无可用账号（{reason}）", "no_account"))
         return JSONResponse(status_code=503,
                             content={"error": {"message": f"无可用账号（{reason}）", "type": "no_account"}})
 
@@ -1174,7 +1223,9 @@ async def chat_completions(
         _record_usage(key.id, 0, str(model), 0.0, None, client_ip=_client_ip(request),
                       use_case="chat-completion", error_kind="model_not_found", http_status=400,
                       req_preview=_store_preview(_extract_input(payload)),
-                      resp_preview=_store_preview(f"模型 '{model}' 不存在或已被禁用"))
+                      resp_preview=_store_preview(f"模型 '{model}' 不存在或已被禁用"),
+                      full_payload=payload,
+                      full_egress=_err_egress(400, f"模型 '{model}' 不存在或已被禁用", "model_not_found"))
         return JSONResponse(
             status_code=400,
             content={"error": {"message": f"模型 '{model}' 不存在或已被禁用", "type": "model_not_found"}},
@@ -1211,7 +1262,9 @@ async def chat_completions(
                       client_ip=_client_ip(request), use_case="chat-completion",
                       error_kind=kind, http_status=503,
                       req_preview=_store_preview(_extract_input(payload)),
-                      resp_preview=_store_preview(readable), full_payload=payload, full_response=msg or "")
+                      resp_preview=_store_preview(readable), full_payload=payload, full_response=msg or "",
+                      full_egress=_err_egress(503, fail_msg, "no_model_available"),
+                      full_up_request=body)
         return JSONResponse(status_code=503,
                             content={"error": {"message": fail_msg, "type": "no_model_available"}})
 
@@ -1239,6 +1292,7 @@ async def chat_completions(
                                 output_text=_extract_output(text))
             updated = sess_i.updated_json()
             sess_i.close()
+            # chat 端点是逐字节透传，网关出口 == 上游响应，两者同文
             _record_usage(key.id, acc_i.id, final_model, usage["credits"], updated,
                           client_ip=_client_ip(request), use_case="chat-completion",
                           prompt_tokens=usage["prompt_tokens"],
@@ -1249,7 +1303,8 @@ async def chat_completions(
                           error_kind="success", http_status=200,
                           req_preview=_store_preview(_extract_input(payload)),
                           resp_preview=_store_preview(_extract_output(text)),
-                          full_payload=payload, full_response=text)
+                          full_payload=payload, full_response=text,
+                          full_egress=text, full_up_request=body)
         except (Exception, asyncio.CancelledError, GeneratorExit) as e:
             # 客户端中途断开（IDE 取消 / 停止生成）时，`yield` 会抛 CancelledError
             # 或 GeneratorExit —— 两者都是 BaseException，except Exception 捕获不到，
@@ -1302,7 +1357,9 @@ async def chat_completions(
                           error_kind=kind, http_status=200,
                           req_preview=_store_preview(_extract_input(payload)),
                           resp_preview=_store_preview(err_text),
-                          full_payload=payload, full_response=err_text)
+                          full_payload=payload, full_response=err_text,
+                          # 出口只包含真正发给客户端的部分；[client_aborted] 只是日志标注
+                          full_egress=partial, full_up_request=body)
             if aborted:
                 raise
         finally:
@@ -1378,7 +1435,9 @@ async def responses_proxy(
         _record_usage(key.id, 0, "unknown", 0.0, None, client_ip=_client_ip(request),
                       use_case="responses", error_kind="invalid_request", http_status=400,
                       req_preview=_store_preview(_extract_input(payload)),
-                      resp_preview=_store_preview(f"请求转换失败：{e}"))
+                      resp_preview=_store_preview(f"请求转换失败：{e}"),
+                      full_payload=payload,
+                      full_egress=_err_egress(400, f"请求转换失败：{e}", "invalid_request"))
         return JSONResponse(status_code=400,
                             content={"error": {"message": f"请求转换失败：{e}", "type": "invalid_request"}})
 
@@ -1395,7 +1454,9 @@ async def responses_proxy(
         _record_usage(key.id, 0, str(requested), 0.0, None, client_ip=_client_ip(request),
                       use_case="responses", error_kind="model_not_found", http_status=400,
                       req_preview=_store_preview(_extract_input(payload)),
-                      resp_preview=_store_preview(f"模型 '{requested}' 不存在或已被禁用"))
+                      resp_preview=_store_preview(f"模型 '{requested}' 不存在或已被禁用"),
+                      full_payload=payload,
+                      full_egress=_err_egress(400, f"模型 '{requested}' 不存在或已被禁用", "model_not_found"))
         return JSONResponse(status_code=400,
                             content={"error": {"message": f"模型 '{requested}' 不存在或已被禁用", "type": "model_not_found"}})
 
@@ -1439,7 +1500,10 @@ async def responses_proxy(
                                 _record_usage(key.id, acc_i.id, m, 0.0, None, client_ip=_client_ip(request),
                                                                   use_case="responses", error_kind=kind, http_status=r.status_code,
                                                                   req_preview=_store_preview(_extract_input(payload)),
-                                                                  resp_preview=_store_preview(text))
+                                                                  resp_preview=_store_preview(text),
+                                                                  full_payload=payload, full_response=text,
+                                                                  full_egress=_err_egress(r.status_code, text, kind),
+                                                                  full_up_request=body)
                                 return JSONResponse(status_code=r.status_code,
                                                     content={"error": {"message": text, "code": r.status_code}})
                             converter = ResponsesStreamConverter(model=model_name)
@@ -1467,7 +1531,9 @@ async def responses_proxy(
                                           seq=seq, error_kind="success", http_status=200,
                                           req_preview=_store_preview(_extract_input(payload)),
                                           resp_preview=_store_preview(_extract_output(r.text)),
-                                          full_payload=payload, full_response=r.text)
+                                          full_payload=payload, full_response=r.text,
+                                          # 出口 = 聚合后的 Responses 对象（客户端实际收到的那份）
+                                          full_egress=_as_text(obj), full_up_request=body)
                             return JSONResponse(content=obj)
                     except Exception as e:
                         kind = _classify_error(0, str(e))
@@ -1481,7 +1547,8 @@ async def responses_proxy(
                           client_ip=_client_ip(request), use_case="responses", seq=seq,
                           error_kind="no_account", http_status=503,
                           req_preview=_store_preview(_extract_input(payload)),
-                          full_payload=payload)
+                          full_payload=payload,
+                          full_egress=_err_egress(503, f"无可用账号（{reason}）", "no_account"))
             return JSONResponse(status_code=503,
                                 content={"error": {"message": f"无可用账号（{reason}）", "type": "no_account"}})
 
@@ -1500,7 +1567,9 @@ async def responses_proxy(
                       client_ip=_client_ip(request), use_case="responses",
                       error_kind=kind, http_status=503,
                       req_preview=_store_preview(_extract_input(payload)),
-                      resp_preview=_store_preview(readable), full_payload=payload, full_response=msg or "")
+                      resp_preview=_store_preview(readable), full_payload=payload, full_response=msg or "",
+                      full_egress=_err_egress(503, fail_msg, "no_model_available"),
+                      full_up_request=chat_body)
         return JSONResponse(status_code=503,
                             content={"error": {"message": fail_msg, "type": "no_model_available"}})
 
@@ -1512,6 +1581,7 @@ async def responses_proxy(
             request_start = time.perf_counter()
             ttfb_at = None
             raw_lines = []
+            egress_lines = []      # 【网关出口】真正发给客户端的事件，用于与入口请求配对
             converter = ResponsesStreamConverter(model=model_name)
             async for line in upstream_r.aiter_lines():
                 if not line.strip():
@@ -1520,10 +1590,12 @@ async def responses_proxy(
                     ttfb_at = time.perf_counter()
                 events = converter.feed_line(line)
                 if events:
+                    egress_lines.append(events)
                     yield events
                 raw_lines.append(line)
             finish = converter.finish()
             if finish:
+                egress_lines.append(finish)
                 yield finish
             text = "\n".join(raw_lines)
             usage = _parse_usage(text)
@@ -1545,7 +1617,9 @@ async def responses_proxy(
                           error_kind="success", http_status=200,
                           req_preview=_store_preview(_extract_input(payload)),
                           resp_preview=_store_preview(_extract_output(text)),
-                          full_payload=payload, full_response=text)
+                          full_payload=payload, full_response=text,
+                          # 出口 = 转换后的 Responses 事件流（客户端实际收到的那些事件）
+                          full_egress="\n".join(egress_lines), full_up_request=chat_body)
         except (Exception, asyncio.CancelledError, GeneratorExit) as e:
             # 同 chat 流式：客户端中途断开会抛 CancelledError / GeneratorExit（BaseException），
             # 必须兜住并补记，否则这类请求一条日志都不会留。
@@ -1592,7 +1666,9 @@ async def responses_proxy(
                           error_kind=kind, http_status=200,
                           req_preview=_store_preview(_extract_input(payload)),
                           resp_preview=_store_preview(err_text),
-                          full_payload=payload, full_response=err_text)
+                          full_payload=payload, full_response=err_text,
+                          # 出口只含中断前已发出的事件；[client_aborted] 仅日志标注
+                          full_egress="\n".join(egress_lines), full_up_request=chat_body)
             if aborted:
                 raise
         finally:

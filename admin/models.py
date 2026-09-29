@@ -96,7 +96,14 @@ class UsageLogDetail(Base):
 
     与 usage_logs 一对一，单独建表避免主表被大字段拖垮；仅在 ADMIN_LOG_FULL 开启时写入。
     payload_json 结构见 admin/routers/proxy.py:_build_detail：
-      {messages, output, tool_calls, reasoning, usage, raw_request, raw_response}
+      {messages, output, tool_calls, reasoning, usage}
+
+    报文按「跳」分组，保证同一组的请求/响应是自洽的一对：
+      - 网关边界（对外，应成对看）：raw_request（客户端→网关）↔ raw_response（网关→客户端）
+      - 上游边界（对内，排查用）：upstream_request（网关→后端）↔ upstream_response（后端→网关）
+
+    历史注意：raw_response 在旧版本里存的是「上游原始响应」，语义已修正为「网关出口响应」；
+    老数据如需追溯上游原文，可忽略时间早于本次上线的行。
     """
 
     __tablename__ = "usage_log_details"
@@ -105,10 +112,14 @@ class UsageLogDetail(Base):
     log_id = Column(Integer, nullable=False, default=0, index=True)
     # 结构化上下文（JSON 字符串）
     payload_json = Column(LONGTEXT, nullable=True)
-    # 原始请求报文（JSON 字符串，未加工）
+    # 【网关入口】客户端发来的原始请求报文（JSON 字符串，未加工）
     raw_request = Column(LONGTEXT, nullable=True)
-    # 原始响应报文（SSE 原文或 JSON 原文，未加工）
+    # 【网关出口】网关最终回给客户端的响应报文（SSE 原文或 JSON 原文）
     raw_response = Column(LONGTEXT, nullable=True)
+    # 【上游请求】网关转换后实际转发给后端的请求报文（JSON 字符串）
+    upstream_request = Column(LONGTEXT, nullable=True)
+    # 【上游响应】后端返回给网关的原始响应报文（SSE 原文或 JSON 原文）
+    upstream_response = Column(LONGTEXT, nullable=True)
     size_bytes = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 

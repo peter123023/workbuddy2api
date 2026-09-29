@@ -121,8 +121,13 @@ def log_detail(
     detail["size_bytes"] = row.size_bytes or 0
     detail["created_at"] = row.created_at.isoformat() if row.created_at else None
     if raw:
+        # 按「跳」返回四份报文，保证同组请求/响应自洽：
+        #   网关边界：raw_request(客户端→网关) ↔ raw_response(网关→客户端)
+        #   上游边界：upstream_request(网关→后端) ↔ upstream_response(后端→网关)
         detail["raw_request"] = row.raw_request or ""
         detail["raw_response"] = row.raw_response or ""
+        detail["upstream_request"] = getattr(row, "upstream_request", "") or ""
+        detail["upstream_response"] = getattr(row, "upstream_response", "") or ""
     return detail
 
 
