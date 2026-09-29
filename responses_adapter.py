@@ -417,9 +417,19 @@ class ResponsesStreamConverter:
         return "".join(events)
 
     def _evt(self, event_type: str, data: dict) -> str:
-        """格式化一个 SSE 事件。"""
+        """格式化一个 SSE 事件。
+
+        OpenAI Responses API 官方 SSE 的每个事件同时带 `event:` 与 `data:` 两行，
+        且 `event:` 名与 data JSON 里的 `type` 完全一致（如
+        `event: response.output_text.delta` + `data: {"type":"response.output_text.delta",...}`）。
+
+        此前只发 `data:`：官方 Python/JS SDK 靠 data 里的 `type` 判别，仍能工作；
+        但按事件名分发的客户端（浏览器 EventSource 的 addEventListener(事件名)、
+        以及严格按官方报文解析的实现）会收不到任何事件。故补上 `event:` 行。
+        """
         payload = {"type": event_type, **data}
-        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        body = json.dumps(payload, ensure_ascii=False)
+        return f"event: {event_type}\ndata: {body}\n\n"
 
     def _msg_item(self, status: str = "in_progress", empty: bool = False) -> dict:
         content = [] if empty else [
