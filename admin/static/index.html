@@ -396,6 +396,7 @@ function enterApp() {
   $("#proxyUrl").textContent = location.origin + "/v1";
   loadAccounts(); loadKeys(); loadModels(); loadSchedules(); loadLogs(); loadSyncConfig(); loadShareInfo();
   refreshBalances(true);  // 页面加载时自动从上游拉取最新积分（静默刷新，刷新后重算总剩余）
+  startBalanceAutoTimers();  // 之后每半小时自动刷新一次，并把刷新时间在"总剩余"旁显示出来
   // 恢复刷新前停留的标签（默认账号）
   let tab = "accounts";
   try { tab = localStorage.getItem(TAB_KEY) || "accounts"; } catch(e) {}
@@ -481,10 +482,11 @@ async function loadAccounts() {
         <span>总剩余</span>
         <button onclick="refreshBalances()" class="text-rose-600 hover:text-rose-800" title="刷新积分（从上游重新拉取各账号余额）"><i class="fa-solid fa-rotate"></i></button>
       </div>
-      <div class="mt-1 flex items-center gap-2"><i class="fa-solid fa-wallet text-rose-600"></i><span class="text-2xl font-bold">${s.balance_remain}</span></div>
+      <div class="mt-1 flex items-center gap-2"><i class="fa-solid fa-wallet text-rose-600"></i><span class="text-2xl font-bold">${s.balance_remain}</span><span id="balRefreshAgo" class="ml-1 text-[11px] font-normal text-slate-400"></span></div>
     </div>`;
   _accData = d.items || [];
   renderAccPage(1);
+  updateBalRefreshLabel();
 }
 function renderAccPage(p) {
   const term = (_accTerm = ($("#accSearch") ? $("#accSearch").value : "").trim().toLowerCase());
@@ -744,15 +746,48 @@ async function importAll(){
   else toast("导入失败","err");
   if(d.errors) console.warn(d.errors);
 }
-// 刷新全部账号余额（从上游重新拉取），重算总剩余。silent=true 时不弹提示（用于页面加载自动刷新）
+// 刷新全部账号余额（从上游重新拉取），重算总剩余。silent=true 时不弹提示（用于页面加载/定时自动刷新）
+let _balRefreshedAt = null;   // 上次刷新成功的时间戳（ms）
+let _balRefreshing = false;   // 是否正在刷新（防并发：手动点击与定时任务撞车时跳过）
+let _balTimersOn = false;     // 自动刷新定时器是否已启动
+const BAL_AUTO_REFRESH_MS = 30 * 60 * 1000;  // 每半小时自动刷新一次
+
+// "总剩余"旁的刷新时间文案（相对时间）
+function balAgoText(){
+  if(_balRefreshing) return "刷新中…";
+  if(!_balRefreshedAt) return "";
+  const min = Math.floor((Date.now() - _balRefreshedAt) / 60000);
+  if(min < 1) return "刚刚刷新";
+  if(min < 60) return `${min}分钟前刷新`;
+  const h = Math.floor(min / 60);
+  if(h < 24) return `${h}小时前刷新`;
+  return `${Math.floor(h / 24)}天前刷新`;
+}
+function updateBalRefreshLabel(){
+  const el = document.getElementById("balRefreshAgo");
+  if(el) el.textContent = balAgoText();
+}
+function startBalanceAutoTimers(){
+  if(_balTimersOn) return;
+  _balTimersOn = true;
+  setInterval(() => { refreshBalances(true); }, BAL_AUTO_REFRESH_MS);  // 每半小时自动刷新
+  setInterval(updateBalRefreshLabel, 60 * 1000);                       // 相对时间每分钟走一次
+}
 async function refreshBalances(silent){
-  const r=await api("/api/accounts"); if(!r.ok){ if(!silent) toast("刷新失败","err"); return null; }
-  const ids=(await r.json()).items.map(x=>x.id);
-  let okN=0;
-  for(const id of ids){ if((await api("/api/accounts/"+id+"/refresh",{method:"POST"})).ok) okN++; }
-  loadAccounts();
-  if(!silent) toast(`积分已刷新（${okN}/${ids.length}）`);
-  return okN;
+  if(_balRefreshing){ if(!silent) toast("正在刷新中…"); return null; }
+  _balRefreshing = true; updateBalRefreshLabel();
+  try{
+    const r=await api("/api/accounts"); if(!r.ok){ if(!silent) toast("刷新失败","err"); return null; }
+    const ids=(await r.json()).items.map(x=>x.id);
+    let okN=0;
+    for(const id of ids){ if((await api("/api/accounts/"+id+"/refresh",{method:"POST"})).ok) okN++; }
+    _balRefreshedAt = Date.now();
+    loadAccounts();
+    if(!silent) toast(`积分已刷新（${okN}/${ids.length}）`);
+    return okN;
+  } finally {
+    _balRefreshing = false; updateBalRefreshLabel();
+  }
 }
 async function refreshAll(){
   const n=await refreshBalances(false);
