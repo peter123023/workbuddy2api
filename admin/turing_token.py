@@ -55,9 +55,13 @@ def get_device_token(force: bool = False) -> str | None:
     # 注意：不要在此处兜底写死某个绝对路径，否则会覆盖 helper 的自动发现逻辑。
 
     try:
+        # Windows 上 text=True 默认按 locale（GBK）解码子进程输出，而 node 输出是
+        # UTF-8；遇到中文/特殊字符会触发 UnicodeDecodeError（subprocess 内部读线程崩，
+        # 且无法被外层 except 捕获）。显式指定 UTF-8 + errors 兜底。
         out = subprocess.run(
             [node, str(_HELPER)],
             capture_output=True, text=True, timeout=25, env=env,
+            encoding="utf-8", errors="replace",
         )
     except Exception:
         return None
