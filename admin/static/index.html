@@ -320,6 +320,15 @@
         <input id="newPwd2" type="password" class="w-full border rounded-lg px-3 py-2 mb-3 text-sm" placeholder="确认新密码" />
         <button onclick="changePassword()" class="px-3 py-1.5 rounded-lg btn-primary text-sm">保存新密码</button>
       </div>
+      <div class="card p-5 max-w-md mt-4">
+        <h3 class="text-sm font-medium mb-3">登录有效期</h3>
+        <div class="flex items-center gap-2 mb-2">
+          <input id="sessionDays" type="number" min="1" max="365" class="w-28 border rounded-lg px-3 py-2 text-sm" placeholder="如 30" />
+          <span class="text-sm text-slate-500">天</span>
+        </div>
+        <p class="text-xs text-slate-400 mb-3">1~365 天。保存后新登录的 Token 在该期限内免重新登录；当前已登录会话不受影响。</p>
+        <button onclick="saveSessionDays()" class="px-3 py-1.5 rounded-lg btn-primary text-sm">保存有效期</button>
+      </div>
     </section>
   </main>
 </div>
@@ -394,7 +403,7 @@ function logout() { localStorage.removeItem(TOKEN_KEY); location.reload(); }
 function enterApp() {
   $("#login").classList.add("hidden"); $("#app").classList.remove("hidden");
   $("#proxyUrl").textContent = location.origin + "/v1";
-  loadAccounts(); loadKeys(); loadModels(); loadSchedules(); loadLogs(); loadSyncConfig(); loadShareInfo();
+  loadAccounts(); loadKeys(); loadModels(); loadSchedules(); loadLogs(); loadSyncConfig(); loadShareInfo(); loadSessionDays();
   refreshBalances(true);  // 页面加载时自动从上游拉取最新积分（静默刷新，刷新后重算总剩余）
   startBalanceAutoTimers();  // 之后每半小时自动刷新一次，并把刷新时间在"总剩余"旁显示出来
   // 恢复刷新前停留的标签（默认账号）
@@ -1195,6 +1204,19 @@ async function changePassword(){
   const r=await api("/api/admin/password",{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({old_password:oldP,new_password:np})});
   if(r.ok){ toast("密码已修改，下次登录生效"); $("#oldPwd").value=$("#newPwd").value=$("#newPwd2").value=""; }
   else { const d=await r.json().catch(()=>({})); toast("修改失败: "+(d.detail||""),"err"); }
+}
+async function loadSessionDays(){
+  const r=await api("/api/admin/session-days");
+  if(!r.ok) return;
+  const d=await r.json().catch(()=>({}));
+  if(d.days != null) $("#sessionDays").value = d.days;
+}
+async function saveSessionDays(){
+  const v=parseInt($("#sessionDays").value,10);
+  if(!(v>=1&&v<=365)){ toast("请输入 1~365 的天数","err"); return; }
+  const r=await api("/api/admin/session-days",{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({days:v})});
+  if(r.ok){ toast("登录有效期已保存（"+v+" 天），下次登录生效"); }
+  else { const d=await r.json().catch(()=>({})); toast("保存失败: "+(d.detail||""),"err"); }
 }
 
 /* ==================== 定时任务 ==================== */

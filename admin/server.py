@@ -100,6 +100,28 @@ def _get_stored_hash() -> str:
     return h
 
 
+# 登录有效期设置（SystemSetting key）：优先级高于 ADMIN_JWT_EXPIRE_HOURS 环境变量
+_K_SESSION_DAYS = "admin_session_days"
+
+
+def _apply_session_days_from_db() -> None:
+    """把 DB 里保存的登录有效期（天）应用到运行时 settings.JWT_EXPIRE_HOURS。
+
+    DB 无值 / 读取异常时保持环境变量默认，不影响登录主流程。
+    """
+    db = SessionLocal()
+    try:
+        row = db.query(SystemSetting).filter(SystemSetting.key == _K_SESSION_DAYS).first()
+        if row and row.value:
+            days = int(row.value)
+            if days >= 1:
+                settings.JWT_EXPIRE_HOURS = days * 24
+    except Exception:
+        pass
+    finally:
+        db.close()
+
+
 @app.post("/api/login")
 def login(
     username: str = Form(...),
@@ -122,6 +144,8 @@ def login(
         raise HTTPException(status_code=401, detail="用户名或密码错误")
     # 仅用户名正确且密码正确才清空失败计数（避免可被探测用户名是否存在）
     clear_failures(ip)
+    # 每次登录前应用 DB 里的有效期设置（保证重启后 DB 仍是权威来源）
+    _apply_session_days_from_db()
     return {"token": create_admin_token()}
 
 
@@ -147,6 +171,46 @@ def change_password(body: PasswordChangeIn, _: bool = Depends(require_admin)):
     finally:
         db.close()
     return {"ok": True}
+
+
+class SessionDaysIn(BaseModel):
+    days: int
+
+
+@app.get("/api/admin/session-days")
+def get_session_days(_: bool = Depends(require_admin)):
+    """返回登录有效期（天）。DB 有设置用 DB，否则回退环境变量默认值。"""
+    db = SessionLocal()
+    try:
+        row = db.query(SystemSetting).filter(SystemSetting.key == _K_SESSION_DAYS).first()
+        if row and row.value:
+            try:
+                return {"days": int(row.value), "source": "db"}
+            except (TypeError, ValueError):
+                pass
+    finally:
+        db.close()
+    return {"days": settings.JWT_EXPIRE_HOURS / 24, "source": "env"}
+
+
+@app.patch("/api/admin/session-days")
+def set_session_days(body: SessionDaysIn, _: bool = Depends(require_admin)):
+    """保存登录有效期（天，1~365）。立即对新签发的登录 Token 生效。"""
+    if not (1 <= body.days <= 365):
+        raise HTTPException(status_code=400, detail="有效期需在 1~365 天之间")
+    db = SessionLocal()
+    try:
+        row = db.query(SystemSetting).filter(SystemSetting.key == _K_SESSION_DAYS).first()
+        if row:
+            row.value = str(body.days)
+        else:
+            db.add(SystemSetting(key=_K_SESSION_DAYS, value=str(body.days)))
+        db.commit()
+    finally:
+        db.close()
+    # 立即生效：后续登录签发的 Token 使用新有效期（已签发的 Token 不受影响）
+    settings.JWT_EXPIRE_HOURS = body.days * 24
+    return {"ok": True, "days": body.days}
 
 
 @app.get("/")
