@@ -166,6 +166,16 @@ WORKBUDDY_VERSION              # 默认 2.0.0
 - `responses_projection.py` —— Codex / agent 请求投影压缩（投影前后消息数 / 字符数 / tool schema 压缩量）
 - `desensitize.py` —— 运行时文本压缩与零宽脱敏（去安全风险词，降低腾讯审核拦截率）
 
+三种协议的 SSE 流格式（由两个适配器统一产出）：
+
+| 协议 | SSE 格式 |
+|------|----------|
+| OpenAI Chat Completions | 仅 `data:` 行（与官方一致，无 `event:` 行） |
+| OpenAI Responses | `event: <type>` + `data: {"type":<type>,...}` 双行，名字一致 |
+| Anthropic Messages | `event:` + `data:` 双行 |
+
+> SSE 规范里 `event:` 行是可选的（缺省按 `message` 处理）；openai SDK 只读 `data` 里的 `type` 字段不依赖它，但 Anthropic SDK 按 `event:` 白名单分发、缺失会静默丢事件——所以 Responses 补齐 `event:` 行以保持规范一致性。
+
 ---
 
 ## 三、多账号代理共享平台（admin）
@@ -176,10 +186,12 @@ WORKBUDDY_VERSION              # 默认 2.0.0
 
 - **批量上传账号**：把桌面端 `.info` 登录文件原文（或数组 / 逐行）批量导入，存进 MySQL
 - **账号池自动切换**：每次请求从「启用 + 还有剩余额度」的账号里挑选（默认剩余最多优先，可切 LRU）
-- **查余额 / 刷新**：后台随时看每个账号总积分、剩余额度，并触发实时刷新
+- **查余额 / 刷新**：后台随时看每个账号总积分、剩余额度并触发实时刷新；「总剩余」卡片每 **30 分钟自动静默刷新**一次，并在数值旁显示相对刷新时间（如 `20分钟前刷新`，每分钟自动走字）
 - **API Key 管理**：后台创建 Key 给别人用，可设每个 Key 的积分上限
 - **配额拦截**：Key 已用积分 ≥ 上限时，代理直接返回 `402 {"error":{"message":"积分已耗尽","type":"quota_exceeded"}}`
 - **用量记录**：每次调用落 `usage_logs`，可按 Key / 账号追溯
+- **完整报文审计（四跳日志）**：开启 `ADMIN_LOG_FULL` 后按「跳」落库完整报文（网关入口/出口 + 上游请求/响应），后台日志详情分组展示，见 [七](#七日志与排障)
+- **登录有效期可配置**：设置页可设 1~365 天免重新登录（默认 24 小时），见 [3.4](#34-环境变量admin)
 - **每日签到定时任务**：见 [五](#五每日签到定时任务daily_checkin)
 
 ### 3.2 稳定性设计（借鉴 `workbuddy2ap-2`）
@@ -193,7 +205,7 @@ WORKBUDDY_VERSION              # 默认 2.0.0
 | **防撞号** | `_select_account` | `last_picked_at` 100ms 窗口，同一账号高并发时不被重复选中 |
 | **状态持久化** | `accounts` 表 + `init_db` 迁移 | 冷却/错误计数/禁用原因直接落库，进程重启不丢失（DB 等价于 state.json） |
 | **凭证续期** | `converter.CredentialManager._refresh` | token 临近过期自动刷新，刷新失败在代理层禁用账号 |
-| **请求级表格日志** | `_log_chat_row` | 每个 `/v1/chat/completions` 请求出口打印 `seq / TTFB / uid / tokens / latency / error_kind` |
+| **请求级表格日志** | `_log_chat_row` | 每个 `/v1/chat/completions` 请求出口打印 `seq / model / TTFB / uid / tokens / latency / error_kind`；模型名完整打印不截断（列宽 24，超长也完整显示） |
 
 ### 3.3 技术栈
 
@@ -206,6 +218,7 @@ WORKBUDDY_VERSION              # 默认 2.0.0
 | 模块 | 接口 | 说明 |
 |------|------|------|
 | 登录 | `POST /api/login` | 返回 JWT（放 `X-Admin-Token`） |
+| 设置 | `GET/PATCH /api/admin/session-days` | 登录有效期（天，1~365）；PATCH 后新签发的登录 Token 立即按新有效期生效 |
 | 账号 | `GET/POST /api/accounts` · `POST /api/accounts/batch` | 账号列表 + 汇总 / 新增单个 / 批量导入 |
 | 账号 | `POST /api/accounts/{id}/refresh` · `PATCH/DELETE /api/accounts/{id}` | 刷新余额 / 改状态 / 删除 |
 | Key | `GET/POST /api/keys` · `PATCH/DELETE /api/keys/{id}` | Key 列表（脱敏）/ 创建 / 改限额 / 停用 / 吊销 |
@@ -216,7 +229,7 @@ WORKBUDDY_VERSION              # 默认 2.0.0
 
 ### 3.4 环境变量（admin）
 
-`ADMIN_DATABASE_URL` · `ADMIN_REDIS_URL` · `ADMIN_BACKEND` · `ADMIN_USERNAME` · `ADMIN_PASSWORD` · `ADMIN_JWT_SECRET`（≥32 字节）· `ADMIN_JWT_EXPIRE_HOURS` · `ADMIN_COST_PER_TOKEN` · `ADMIN_ACCOUNT_SELECT`（`remain` / `lru`）· `ADMIN_PORT`
+`ADMIN_DATABASE_URL` · `ADMIN_REDIS_URL` · `ADMIN_BACKEND` · `ADMIN_USERNAME` · `ADMIN_PASSWORD` · `ADMIN_JWT_SECRET`（≥32 字节）· `ADMIN_JWT_EXPIRE_HOURS`（默认 24 小时；可被后台「设置 → 登录有效期」覆盖，该设置存 `system_settings` 表、优先级更高，改后对新登录立即生效）· `ADMIN_COST_PER_TOKEN` · `ADMIN_ACCOUNT_SELECT`（`remain` / `lru`）· `ADMIN_PORT`
 
 ### 3.5 已知限制
 
@@ -440,6 +453,21 @@ python converter.py --desensitize --log converter.log
 
 每次请求带唯一 ID，常见：`REQUEST BODY` · `RESPONSES → CHAT BODY` · `RESPONSES PROJECTION` · `RESPONSE BODY` · `RESPONSE RAW SSE` · `⚠️内容审核拦截`。`RESPONSES PROJECTION` 会给出投影前后消息数 / 字符数 / tool schema 压缩量。
 
+### 管理后台完整报文审计（四跳日志）
+
+开启 `ADMIN_LOG_FULL`（默认开）后，托管网关的每次调用除 `usage_logs` 汇总行外，还会在 `usage_log_details` 按「跳」落库完整报文，四份各司其职、同组自洽：
+
+| 字段 | 边界 | 内容 |
+|------|------|------|
+| `raw_request` | ① 网关入口 | 客户端 → 网关的原始请求（对外协议原样） |
+| `raw_response` | ② 网关出口 | 网关 → 客户端的最终响应（SSE 原文或 JSON） |
+| `upstream_request` | ③ 上游请求 | 网关转换后 → 腾讯后端的请求（对内协议） |
+| `upstream_response` | ④ 上游响应 | 腾讯后端 → 网关的原始响应 |
+
+- 后台「日志」页点开详情按「网关边界 ①② / 上游边界 ③④」两组展示，入口/出口、上游请求/响应各自成对看
+- 排障要点：入口是 Responses 格式时，出口与上游是 Chat 格式——**结构化抽取（output / reasoning / tool_calls）必须用上游文本（chat 格式）**，不能拿出口的 Responses 事件流去解析
+- 报文默认保留 7 天（`ADMIN_LOG_RETENTION_DAYS`），超期自动清理
+
 ### 常见问题
 
 - **找不到登录文件**：桌面端没登录，或登录目录不在默认路径（macOS `~/Library/Application Support/CodeBuddyExtension/Data/Public/auth`；Windows `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth`；Linux `~/.local/share/CodeBuddyExtension/Data/Public/auth`）。
@@ -447,6 +475,7 @@ python converter.py --desensitize --log converter.log
 - **响应慢**：换更快的模型如 `deepseek-v4-flash`。
 - **被「敏感内容」拦截**：多为 agent runtime 文本触发（DoS / exploit / credential / sandbox / escalation / 竞争品牌词 / tool description 安全术语）。排查顺序：开 `--log` → 看 `REQUEST BODY` → Codex 看 `RESPONSES PROJECTION` → 开 `--desensitize` → 仍不稳试 `--desensitize --no-compact`。
 - **签到 / 对话被风控**：确认本机装了桌面端且 `turing_helper.js` 能取到 token（`X-Device-Token` 已注入）。可 `python -c "from admin.turing_token import get_device_token; print(get_device_token())"` 验证。
+- **控制台刷 `UnicodeDecodeError: 'gbk' codec ...`（subprocess `_readerthread`）**：Windows 上 `subprocess` 文本模式默认按 GBK 解码子进程输出，而 node 输出是 UTF-8，遇到中文/特殊字符必炸。本项目 `admin/turing_token.py` 已显式 `encoding="utf-8", errors="replace"`；自己新增子进程调用时同样要显式指定。该异常发生在 subprocess 内部读线程里，外层 `except` 捕获不到，但**不影响请求主流程**（仅 turing token 降级为 `None`）。
 
 ---
 
